@@ -1,0 +1,94 @@
+# DECISIONS.md
+
+A living record of architectural decisions for this take-home: what we chose, what we left out, the tradeoffs, and how the system would evolve toward production at scale. Updated as decisions are made.
+
+## Scope
+
+- **Datasets in scope:**
+  - `abcnews-date-text.csv` — ~1.24M Australian ABC News headlines, 2003+
+  - `analyst_ratings_processed.csv` — ~1.4M US ticker-tagged headlines, 2009-02 → 2020-06
+  - `raw_partner_headlines.csv` — ~1.8M US ticker-tagged partner-publisher headlines, 2010-02 → 2020
+  - `prices-split-adjusted.csv` — daily S&P 500 prices, 2010-01-04 → 2016-12-30, ~500 tickers
+  - `securities.csv` — S&P 500 metadata
+  - `fundamentals.csv` — per-ticker fundamentals
+- **Excluded:** raw unadjusted `prices.csv` (split-adjusted is correct for returns); `raw_analyst_ratings.csv` (a wider duplicate of `analyst_ratings_processed.csv` we don't need).
+- The two US headline corpora cover the full 2010–2016 NYSE window with years to spare, enabling real cause/effect analysis. ABC News stays as a second corpus to demonstrate multi-source tooling and honor the original brief.
+- **Goal:** an end-to-end agent platform that takes a task, makes ≥1 LLM call, uses the data, and returns a response — runnable via `docker compose up` plus a thin host-side client script.
+
+## Tech stack
+
+| Concern | Choice | Why |
+|---|---|---|
+| Language | Python 3.11+ | Single-language stack; matches the LLM/data tooling. |
+| LLM framework | LiteLLM, default `claude-sonnet-4-6` | Provider-portable, avoids vendor lock-in; Sonnet 4.6 is the cost/quality sweet spot for tool-using agents. |
+| Agent surface | FastAPI (uvicorn) inside the agent container | An HTTP boundary is where production concerns (auth, rate limits, request tracing, multi-tenant routing) attach. CLI script (`agent.py`) on the host is a thin client over HTTP. |
+| Storage | **Postgres 16** with `tsvector` FTS, fronted by **pgbouncer** | At ~650MB CSV / ~4.5M headlines, we're in real-data territory. Postgres in its own container with a connection pooler is what production looks like; SQLite would have worked but would force a doc-only scale story. `tsvector` is native, supports stemming + phrase ranking. |
+| Forecasting | `statsmodels` ARIMA | Standard, lightweight; a defensible demo of a stats tool inside the agent loop. |
+| Observability | Postgres `traces` table + structured stdout logs | Production-shaped at near-zero cost since Postgres is already in the stack. |
+| Context management | Simplified port of the compaction pattern from `AgenticCRE` | Token-budget trigger, tail preservation, tool_use↔tool_result pair-safety walk-back, integrity backstop. CRE-specific signal extraction (URL/captcha/PIN/[KEY DECISION] regex) stripped out. |
+| Telemetry | `litellm.callbacks` `CustomLogger` writing to the Postgres `traces` table | Same hook pattern as `AgenticCRE`'s bridge but with one sink instead of a JSONL recorder. Cost, latency, tokens, tool-call names captured automatically. |
+
+## Data layer
+
+- **Ingestion:** a one-shot `ingest` service in docker-compose. Streams each CSV via `psycopg.copy()` (binary COPY is dramatically faster than INSERT loops). Idempotent — safe to re-run; uses `INSERT … ON CONFLICT DO NOTHING` against natural keys or a content-hash unique constraint where no natural key exists.
+- **Schema (planned):**
+  - `abc_headlines(publish_date DATE, headline TEXT)` — Australian general news.
+  - `us_headlines(headline_id BIGSERIAL, source TEXT, published_at TIMESTAMPTZ, headline TEXT, ticker TEXT)` — both US sources unioned with a `source` discriminator (`'analyst' | 'partner'`).
+  - `securities(ticker TEXT PRIMARY KEY, security_name, sector, sub_industry, address, date_first_added DATE, cik)`.
+  - `prices(date DATE, ticker TEXT, open NUMERIC, high NUMERIC, low NUMERIC, close NUMERIC, volume BIGINT, PRIMARY KEY (ticker, date))`.
+  - `fundamentals(ticker TEXT, period_end DATE, …wide metric columns…)`.
+  - `traces(id BIGSERIAL, task_id UUID, turn_index INT, ts TIMESTAMPTZ DEFAULT now(), model TEXT, role TEXT, prompt JSONB, response JSONB, tool_calls JSONB, input_tokens INT, output_tokens INT, cost_usd NUMERIC, latency_ms INT, error TEXT)`.
+- **Indexes:**
+  - GIN over `to_tsvector('english', headline)` on `abc_headlines` and `us_headlines`.
+  - B-tree on `published_at` and `ticker` for `us_headlines`.
+  - B-tree on `(ticker, date)` for `prices` (covered by PK).
+- **pgbouncer:** transaction-pooling mode. The agent service connects to `pgbouncer:6432`. Note: transaction-pooling disables prepared statements, so `asyncpg` is configured with `statement_cache_size=0`.
+
+## Agent design
+
+- **Loop:** LiteLLM tool-use with a tool-use round budget (`max_rounds_with_tool_calls`, default 10), per-tool timeout, and compaction triggered above a configurable cumulative-input-token threshold (default 20k). When the budget is exhausted with tool calls still pending, the model never got a turn to consume the last tool result — so one final tool-free `acompletion` call lets it synthesize an answer from the history. A capped run therefore still ends with a real answer, not a stub, at a worst-case cost of budget + 1 LLM calls.
+- **Tool registry (planned, evolving):**
+  - `headline_search(query, source?, ticker?, start_date?, end_date?, limit?)` — `tsvector` FTS with `ts_rank` ordering.
+  - `headline_topic_frequency(query, granularity, source?)` — counts over time.
+  - `lookup_security(name_or_ticker)`.
+  - `price_history(ticker, start_date, end_date)`.
+  - `returns(ticker, start_date, end_date)` — derived from prices.
+  - `forecast_returns(ticker, horizon)` — `statsmodels` ARIMA fit + predict.
+  - `fundamentals_lookup(ticker, metric, as_of)`.
+  - `sql(query)` — read-only escape hatch with statement timeout and row cap.
+- **Safety:** the `sql` tool uses a connection role with read-only permissions, `SET statement_timeout`, and `LIMIT` injection / row cap. Every tool input is logged to `traces` before execution.
+
+## Observability
+
+- Each agent turn writes a row to `traces`: task_id, turn_index, model, prompt JSONB, response JSONB, tool_calls JSONB, token counts, cost, latency, error.
+- The LiteLLM telemetry callback feeds the same table — every LLM call captured uniformly regardless of where it originates.
+- Stdout logs are structured (JSON) so a future log aggregator can ingest them without parsing changes.
+
+## Known limitations (deliberate)
+
+- **ABC News is Australian; financial data is US.** Cross-corpus correlation only fires meaningfully on the US headlines (`us_headlines` ↔ `prices`). ABC News is retained as a separate corpus to demonstrate multi-source tooling and honor the original brief.
+- **No fuzzy/trigram matching (`pg_trgm`).** The LLM is the query author here, not a human typing into a search box. The agent can rephrase or normalize queries itself if `tsvector` returns nothing. `pg_trgm` would be the right call if the surface were a search UI for end users.
+- **No semantic search / embeddings.** `tsvector` covers keyword recall. Documented as a next step but skipped to keep ingestion cheap and the demo crisp. `pgvector` is a schema-migration step away when wanted.
+- **No MCP servers.** Considered as an extensibility surface; exposing in-process Python tools as MCPs is mostly ceremony for a single-agent demo, and no specific external capability emerged as load-bearing.
+- **No web fetch.** Agent is grounded only in the local datasets.
+- **Single-tenant, no auth.** FastAPI service is unauthenticated; assumes a trusted caller.
+- **No Terraform.** Considered for the production-deployment story; rejected as adding noise without paying for itself in a take-home. The "deploy at scale" story lives in prose below.
+
+## How we'd evolve this toward production at scale
+
+- **Storage:** swap the in-container Postgres for **managed Postgres** (RDS / Cloud SQL) with read replicas behind pgbouncer. Agent code is unchanged — only the connection string. Vertical-scale the writer; horizontal-scale readers via the replica fan-out.
+- **Ingestion:** move from a one-shot container → orchestrated DAG (Airflow / Prefect / Dagster) with backfills, schema validation, dead-letter handling, and incremental loads. Watermarks per source.
+- **Embeddings:** add an embedding pass at ingestion + `pgvector` HNSW index. Hybrid retrieval (`tsvector` BM25 + cosine rerank). NER at ingestion so ABC News headlines can be linked to tickers where mentions exist.
+- **Agent runtime:** the FastAPI service runs behind a load balancer, autoscales on inflight requests, and offloads long-running tasks (multi-minute ARIMA fits, large SQL escapes) into a worker pool with a queue (Redis / SQS / Kafka). HTTP boundary returns a `task_id` immediately; clients poll `/tasks/{id}` for status.
+- **Observability:** OpenTelemetry traces end-to-end; Langfuse (or equivalent) for prompt/response review; alerting on latency, error rate, token cost, and tool-error rate per task class.
+- **Tool sandboxing:** the SQL escape hatch graduates to a dedicated query service with row-level RBAC, query-plan inspection, per-tenant budgets, and circuit-breaking on expensive plans.
+- **Eval harness:** task fixtures with expected outputs; regression tests on prompt or model changes; offline scoring before any model swap.
+- **Secrets:** vault-backed config (Vault / AWS Secrets Manager / Doppler); per-tenant API key scoping; automatic rotation.
+- **MCP:** when extensibility is actually needed, expose stable, vetted tools as MCP servers so other agents in the org can compose them. Adopting MCP only once we have a reuse story makes the abstraction earn its weight.
+
+## Open items
+
+- Exact compaction trigger thresholds for our (likely shorter) conversations — tune empirically.
+- Initial agent system prompt and seed examples.
+- Eval fixture set (golden tasks + expected behavior).
+- Whether to provide a single composite tool (e.g. `correlate_headlines_to_returns`) or let the agent compose primitives. Lean: primitives, because composition is what the agent loop is for.

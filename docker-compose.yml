@@ -1,0 +1,127 @@
+# Anthelion take-home: agent platform end-to-end.
+#
+# Bring everything up with:    docker compose up --build
+# Run a task from the host:    python agent.py "your task here"
+#
+# Topology:
+#   postgres (data + traces)
+#       ▲                ▲
+#       │ writer hot     │ read-only (sql() tool, direct)
+#   pgbouncer (6432)     │
+#       ▲                │
+#       └──── agent (FastAPI :8000)
+#   ingest (one-shot, populates postgres on first run; idempotent on re-runs)
+#
+# All non-secret vars default to sensible dev values so a bare .env
+# containing only ANTHROPIC_API_KEY brings the stack up cleanly.
+
+# Pinned project name so the data volume (anthelion_take_home_anthelion_pgdata)
+# and container names stay stable regardless of the directory the repo lives in.
+name: anthelion_take_home
+
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: anthelion_postgres
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-anthelion}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-anthelion_dev_pw}
+      POSTGRES_DB:       ${POSTGRES_DB:-anthelion}
+      # Surfaced for db/02-setup-roles.sh to read.
+      POSTGRES_READONLY_USER:     ${POSTGRES_READONLY_USER:-anthelion_ro}
+      POSTGRES_READONLY_PASSWORD: ${POSTGRES_READONLY_PASSWORD:-anthelion_ro_dev_pw}
+    volumes:
+      - anthelion_pgdata:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # Statement timeout is enforced per-connection on the read-only pool
+    # (see service/db.py). A server-wide timeout would kill long ingest COPY
+    # operations, so we deliberately don't set one here.
+
+  pgbouncer:
+    # edoburu/pgbouncer is the community-maintained pgbouncer image.
+    # Replaces bitnami/pgbouncer (deprecated when Bitnami's image catalog
+    # moved). Env-var conventions differ (DB_*, LISTEN_PORT, no PGBOUNCER_*
+    # prefix); the role in the stack is unchanged.
+    image: edoburu/pgbouncer:latest
+    container_name: anthelion_pgbouncer
+    environment:
+      DB_HOST:     postgres
+      DB_PORT:     5432
+      DB_USER:     ${POSTGRES_USER:-anthelion}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-anthelion_dev_pw}
+      DB_NAME:     ${POSTGRES_DB:-anthelion}
+      LISTEN_PORT: 6432
+      POOL_MODE:   transaction
+      AUTH_TYPE:   scram-sha-256
+      MAX_CLIENT_CONN:    100
+      DEFAULT_POOL_SIZE:  20
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ingest:
+    build: ./ingest
+    container_name: anthelion_ingest
+    environment:
+      POSTGRES_HOST:     postgres   # bypass pgbouncer; COPY uses prepared writes
+      POSTGRES_PORT:     5432
+      POSTGRES_USER:     ${POSTGRES_USER:-anthelion}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-anthelion_dev_pw}
+      POSTGRES_DB:       ${POSTGRES_DB:-anthelion}
+    volumes:
+      # Mount the CSVs read-only. Files live at the repo root so the
+      # evaluator doesn't have to move anything; ingest reads from /data.
+      - ./:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"   # one-shot; finishes and exits with code 0
+
+  agent:
+    build:
+      # Root context so the Dockerfile can COPY the shared requirements.txt.
+      context: .
+      dockerfile: service/Dockerfile
+    container_name: anthelion_agent
+    environment:
+      # The only hard-required var — compose fails loudly if missing.
+      ANTHROPIC_API_KEY:          ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY must be set in .env or environment}
+      LITELLM_MODEL:              ${LITELLM_MODEL:-anthropic/claude-sonnet-4-6}
+      AGENT_MAX_ROUNDS_WITH_TOOL_CALLS: ${AGENT_MAX_ROUNDS_WITH_TOOL_CALLS:-10}
+      COMPACTION_TRIGGER_TOKENS:  ${COMPACTION_TRIGGER_TOKENS:-20000}
+      COMPACTION_PRESERVE_RECENT: ${COMPACTION_PRESERVE_RECENT:-4}
+      # Writer pool goes through pgbouncer.
+      POSTGRES_HOST:     pgbouncer
+      POSTGRES_PORT:     6432
+      POSTGRES_USER:     ${POSTGRES_USER:-anthelion}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-anthelion_dev_pw}
+      POSTGRES_DB:       ${POSTGRES_DB:-anthelion}
+      # Read-only pool talks to postgres directly (low volume; avoids
+      # multi-user pgbouncer config).
+      POSTGRES_READONLY_HOST:     postgres
+      POSTGRES_READONLY_PORT:     5432
+      POSTGRES_READONLY_USER:     ${POSTGRES_READONLY_USER:-anthelion_ro}
+      POSTGRES_READONLY_PASSWORD: ${POSTGRES_READONLY_PASSWORD:-anthelion_ro_dev_pw}
+      AGENT_SQL_STATEMENT_TIMEOUT_MS: ${AGENT_SQL_STATEMENT_TIMEOUT_MS:-10000}
+      AGENT_SQL_ROW_CAP:              ${AGENT_SQL_ROW_CAP:-1000}
+    ports:
+      - "${AGENT_SERVICE_PORT:-8000}:8000"
+    depends_on:
+      pgbouncer:
+        condition: service_started
+      ingest:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  anthelion_pgdata:

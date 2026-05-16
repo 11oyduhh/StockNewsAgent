@@ -1,0 +1,11 @@
+[flake8]
+max-line-length = 100
+# E203 and W503 are intentionally black-incompatible defaults; ignoring is canonical.
+extend-ignore = E203, W503
+exclude = .venv, __pycache__, build, dist
+# prompts.py is one large LLM-facing string — line length is meaningless there.
+# tools.py has many long description strings inside TOOL_DEFINITIONS that the
+# model reads; wrapping them with concat would just hurt readability.
+per-file-ignores =
+    service/prompts.py:E501
+    service/tools.py:E501

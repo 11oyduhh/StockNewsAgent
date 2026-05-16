@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+
+# Env / secrets
+.env
+.env.local
+
+# Postgres data (if mounted locally)
+pgdata/
+
+# Large raw data — keep CSVs out of git; the evaluator places them locally
+*.csv
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude Code local config (not shared)
+.claude/

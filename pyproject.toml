@@ -1,0 +1,62 @@
+[project]
+name = "anthelion-agent"
+version = "0.1.0"
+description = "Take-home: an agent platform over news headlines + S&P 500 financial data."
+requires-python = ">=3.11"
+dependencies = [
+    "litellm>=1.60.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "asyncpg>=0.30.0",
+    "psycopg[binary]>=3.2.0",
+    "statsmodels>=0.14.0",
+    "pandas>=2.2.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.10.0",
+    "mypy>=1.13.0",
+    "flake8>=7.1.0",
+    "Flake8-pyproject>=1.2.3",  # lets flake8 read its config from pyproject.toml
+]
+
+# Application, not a package — uv shouldn't try to install us as a wheel.
+[tool.uv]
+package = false
+
+
+# ── Code-quality tooling ───────────────────────────────────────────────
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+    \.venv
+  | __pycache__
+  | build
+  | dist
+)/
+'''
+
+[tool.mypy]
+python_version = "3.11"
+warn_redundant_casts = true
+warn_unused_ignores = true
+strict_optional = true
+no_implicit_optional = true
+check_untyped_defs = true
+ignore_missing_imports = true   # statsmodels, litellm — third-party stubs are spotty
+# Keep this off for now; full annotation discipline is a separate lift.
+disallow_untyped_defs = false
+exclude = ['\.venv', 'build', 'dist']
+
+[tool.flake8]
+max-line-length = 100
+# E203, W503 are black-incompatible; ignoring is the canonical fix.
+extend-ignore = ["E203", "W503"]
+exclude = [".venv", "__pycache__", "build", "dist"]
