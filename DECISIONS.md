@@ -47,16 +47,12 @@ A living record of architectural decisions for this take-home: what we chose, wh
 ## Agent design
 
 - **Loop:** LiteLLM tool-use with a tool-use round budget (`max_rounds_with_tool_calls`, default 10), per-tool timeout, and compaction triggered above a configurable cumulative-input-token threshold (default 20k). When the budget is exhausted with tool calls still pending, the model never got a turn to consume the last tool result — so one final tool-free `acompletion` call lets it synthesize an answer from the history. A capped run therefore still ends with a real answer, not a stub, at a worst-case cost of budget + 1 LLM calls.
-- **Tool registry (planned, evolving):**
-  - `headline_search(query, source?, ticker?, start_date?, end_date?, limit?)` — `tsvector` FTS with `ts_rank` ordering.
-  - `headline_topic_frequency(query, granularity, source?)` — counts over time.
-  - `lookup_security(name_or_ticker)`.
-  - `price_history(ticker, start_date, end_date)`.
-  - `returns(ticker, start_date, end_date)` — derived from prices.
-  - `forecast_returns(ticker, horizon)` — `statsmodels` ARIMA fit + predict.
-  - `fundamentals_lookup(ticker, metric, as_of)`.
-  - `sql(query)` — read-only escape hatch with statement timeout and row cap.
-- **Safety:** the `sql` tool uses a connection role with read-only permissions, `SET statement_timeout`, and `LIMIT` injection / row cap. Every tool input is logged to `traces` before execution.
+- **Tool model — load then analyze.** Tools split in two kinds. *Inline tools* (`headline_search`, `headline_topic_frequency`, `lookup_security`) return small results directly. *Loaders* (`load_prices`, `load_dataset_sql`) pull a potentially large result set into a server-side pandas DataFrame held in the run's `DatasetRegistry` and return only a **handle** plus the frame's shape, schema, and a tiny head sample. *Analysis tools* (`dataset_describe`, `dataset_sample`, `dataset_rolling`, `dataset_correlation`, `dataset_arima`) compute over a handle and return small results. The agent never receives bulk data rows.
+- **Why this shape.** A single multi-year `price_history` result was ~47k tokens of raw rows fed straight into context. Truncating loses data the agent may need; conversation compaction cannot help — it summarizes *old* turns, not a fresh oversized result. The load-then-analyze split eliminates large tool results *by construction*: raw rows never leave the server, so there is no oversized result to cap. Compaction is left to do only its real job (history accumulation).
+- **Dataset lifecycle.** One `DatasetRegistry` per run, cleared in a `finally` when the run ends. In-process memory; no TTL or eviction because the lifetime is bounded to a single task. Loaders apply a generous RAM row cap (`AGENT_DATASET_MAX_ROWS`, default 200k) — a memory guard, distinct from the (eliminated) context-size problem.
+- **Fixed analysis menu = deliberate capability boundary.** The `dataset_*` tools are the complete supported operation set. Requests outside it (fit an LSTM, train XGBoost, bespoke econometrics) have no tool; the system prompt instructs the agent to decline rather than improvise. ARIMA is retained as one analysis op, honestly framed as a naive baseline.
+- **Misapplication guard.** The advertised tool list is static (low complexity). Rather than dynamically varying it per dataset type, each analysis tool validates the handle's schema (column exists, dtype numeric where required) and returns a clear error the agent recovers from — cheaper and more robust than maintaining a dataset-type→tool mapping.
+- **Safety.** `load_dataset_sql` runs through a read-only role with `SET statement_timeout` and `default_transaction_read_only`, and the query is wrapped in an outer `LIMIT`. Every tool input is logged to `traces` before execution.
 
 ## Observability
 
@@ -72,6 +68,8 @@ A living record of architectural decisions for this take-home: what we chose, wh
 - **No MCP servers.** Considered as an extensibility surface; exposing in-process Python tools as MCPs is mostly ceremony for a single-agent demo, and no specific external capability emerged as load-bearing.
 - **No web fetch.** Agent is grounded only in the local datasets.
 - **Single-tenant, no auth.** FastAPI service is unauthenticated; assumes a trusted caller.
+- **Dataset registry is in-process.** Loaded datasets live in the agent process's memory, scoped to one run. Fine for a single agent container; a multi-replica deployment would need a shared results store (see below).
+- **Fixed analysis menu.** The agent can only run the operations the `dataset_*` tools expose (summary stats, sampling, rolling stats, correlation, ARIMA). Custom modeling — LSTM, gradient-boosted trees, bespoke econometrics — is out of scope by design and declined rather than faked.
 - **No Terraform.** Considered for the production-deployment story; rejected as adding noise without paying for itself in a take-home. The "deploy at scale" story lives in prose below.
 
 ## How we'd evolve this toward production at scale
@@ -81,7 +79,8 @@ A living record of architectural decisions for this take-home: what we chose, wh
 - **Embeddings:** add an embedding pass at ingestion + `pgvector` HNSW index. Hybrid retrieval (`tsvector` BM25 + cosine rerank). NER at ingestion so ABC News headlines can be linked to tickers where mentions exist.
 - **Agent runtime:** the FastAPI service runs behind a load balancer, autoscales on inflight requests, and offloads long-running tasks (multi-minute ARIMA fits, large SQL escapes) into a worker pool with a queue (Redis / SQS / Kafka). HTTP boundary returns a `task_id` immediately; clients poll `/tasks/{id}` for status.
 - **Observability:** OpenTelemetry traces end-to-end; Langfuse (or equivalent) for prompt/response review; alerting on latency, error rate, token cost, and tool-error rate per task class.
-- **Tool sandboxing:** the SQL escape hatch graduates to a dedicated query service with row-level RBAC, query-plan inspection, per-tenant budgets, and circuit-breaking on expensive plans.
+- **Tool sandboxing:** the SQL escape hatch (`load_dataset_sql`) graduates to a dedicated query service with row-level RBAC, query-plan inspection, per-tenant budgets, and circuit-breaking on expensive plans.
+- **Dataset store:** the in-process `DatasetRegistry` becomes a shared results store (Redis / Arrow Flight / a small results service) so loaded datasets survive across workers and outlive a single request — enabling multi-replica agents and letting an out-of-band UI page a result without an LLM round-trip. The analysis tools are unchanged; only `get`/`put` move behind the network.
 - **Eval harness:** task fixtures with expected outputs; regression tests on prompt or model changes; offline scoring before any model swap.
 - **Secrets:** vault-backed config (Vault / AWS Secrets Manager / Doppler); per-tenant API key scoping; automatic rotation.
 - **MCP:** when extensibility is actually needed, expose stable, vetted tools as MCP servers so other agents in the org can compose them. Adopting MCP only once we have a reuse story makes the abstraction earn its weight.
@@ -91,4 +90,4 @@ A living record of architectural decisions for this take-home: what we chose, wh
 - Exact compaction trigger thresholds for our (likely shorter) conversations — tune empirically.
 - Initial agent system prompt and seed examples.
 - Eval fixture set (golden tasks + expected behavior).
-- Whether to provide a single composite tool (e.g. `correlate_headlines_to_returns`) or let the agent compose primitives. Lean: primitives, because composition is what the agent loop is for.
+- ~~Whether to provide a single composite tool vs. primitives.~~ Resolved: primitives — loaders + a fixed analysis menu the agent composes (load → describe → sample/rolling/correlate/arima).

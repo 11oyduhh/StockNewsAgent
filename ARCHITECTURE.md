@@ -97,7 +97,7 @@ flowchart TD
     SEED --> CHECK{"cumulative tokens<br/>over threshold?"}
     CHECK -->|yes| COMPACT["compact: summarize old turns,<br/>keep recent tail verbatim,<br/>walk back for tool-pair safety"]
     CHECK -->|no| CALL
-    COMPACT --> CALL["LiteLLM acompletion<br/>(messages + 8 tools)"]
+    COMPACT --> CALL["LiteLLM acompletion<br/>(messages + tool definitions)"]
     CALL --> TOOLS{"model returned<br/>tool calls?"}
     TOOLS -->|no| DONE([return answer + run summary])
     TOOLS -->|yes| DISPATCH["dispatch each tool,<br/>append results as tool messages,<br/>write tool_call traces"]
@@ -109,48 +109,57 @@ flowchart TD
 
 ---
 
-## 4. Tools → data
+## 4. Tools — load then analyze
 
-The 8 tools the model can call, and the tables they read.
+Tools split in two kinds. **Inline tools** return small results straight to
+the model. **Loaders** pull a large result set into a server-side pandas
+DataFrame (the per-run `DatasetRegistry`) and return only a *handle* + shape.
+**Analysis tools** compute over a handle and return small results — so bulk
+rows never enter the model's context.
 
 ```mermaid
 graph LR
-    subgraph TOOLS["tool registry (service/tools.py)"]
-        T1["headline_search"]
-        T2["headline_topic_frequency"]
-        T3["lookup_security"]
-        T4["price_history"]
-        T5["returns"]
-        T6["forecast_returns"]
-        T7["fundamentals_lookup"]
-        T8["sql — read-only escape hatch"]
+    subgraph INLINE["inline tools — small results"]
+        I1["headline_search"]
+        I2["headline_topic_frequency"]
+        I3["lookup_security"]
+    end
+    subgraph LOADERS["loaders — return a handle"]
+        L1["load_prices"]
+        L2["load_dataset_sql"]
+    end
+    subgraph ANALYSIS["analysis tools — operate on a handle"]
+        A1["dataset_describe"]
+        A2["dataset_sample"]
+        A3["dataset_rolling"]
+        A4["dataset_correlation"]
+        A5["dataset_arima"]
     end
 
-    ABC[("abc_headlines")]
-    US[("us_headlines")]
-    SEC[("securities")]
-    PR[("prices")]
-    FUN[("fundamentals")]
+    DB[("Postgres<br/>headlines · prices · securities · fundamentals")]
+    REG[["DatasetRegistry<br/>(per-run, in-memory)"]]
 
-    T1 --> ABC
-    T1 --> US
-    T2 --> ABC
-    T2 --> US
-    T3 --> SEC
-    T4 --> PR
-    T5 --> PR
-    T6 --> PR
-    T7 --> FUN
-    T8 -.->|"any table, SELECT only"| ABC
-    T8 -.-> US
-    T8 -.-> SEC
-    T8 -.-> PR
-    T8 -.-> FUN
+    I1 --> DB
+    I2 --> DB
+    I3 --> DB
+    L1 --> DB
+    L2 -.->|"SELECT only"| DB
+    L1 --> REG
+    L2 --> REG
+    REG --> A1
+    REG --> A2
+    REG --> A3
+    REG --> A4
+    REG --> A5
+    A3 -->|"new handle"| REG
 ```
 
-The first 7 are structured, scoped tools. `sql()` is a guarded escape
-hatch (read-only role, statement timeout, row cap) for anything the
-structured tools don't cover.
+The model calls a loader, gets a handle (`ds_1`), then calls analysis tools
+on it. `dataset_rolling` produces a derived dataset, so it writes a new
+handle back. `load_dataset_sql` is the guarded escape hatch (read-only role,
+statement timeout, outer `LIMIT`) for shapes the structured loaders don't
+cover — e.g. a SQL join of headline counts to prices. The analysis menu is
+fixed: requests outside it (LSTM, custom models) are declined, not faked.
 
 ---
 

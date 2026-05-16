@@ -1,21 +1,26 @@
 """Tool registry for the agent.
 
-Eight tools plus a dispatcher. Each tool is an async function returning
-a JSON-serialisable dict; ``TOOL_DEFINITIONS`` is the OpenAI-format
-schema list passed to LiteLLM; ``dispatch(name, args)`` runs the named
-tool and returns its result (or a structured error).
+Two kinds of tools:
 
-The ``sql`` tool routes through the read-only pool, which has
-``statement_timeout`` and ``default_transaction_read_only`` set per
-connection. Everything else uses the writer pool.
+* **Inline tools** return small results directly (``headline_search``,
+  ``headline_topic_frequency``, ``lookup_security``).
+* **Loaders** (``load_prices``, ``load_dataset_sql``) pull a potentially
+  large result set into a server-side pandas DataFrame held in the run's
+  :class:`~service.datasets.DatasetRegistry`, and return only a *handle* +
+  shape/schema/head. **Analysis tools** (``dataset_*``) then operate on a
+  handle and return small results.
+
+The agent never receives bulk rows — see ``service/datasets.py`` and
+DECISIONS.md. ``TOOL_DEFINITIONS`` is the OpenAI-format schema list passed to
+LiteLLM; ``dispatch(name, args, registry)`` runs the named tool.
 
 Conventions:
 
 * Dates accepted as ISO ``YYYY-MM-DD`` strings.
-* Result rows: dates rendered as ISO strings, NUMERIC as floats. The
-  ``_json_safe`` helper normalises asyncpg Record / Decimal / date.
-* Empty result sets return ``{"rows": [], "note": "<hint>"}`` rather
-  than erroring — lets the agent decide whether to broaden the query.
+* Empty / not-found results return ``{"error": "..."}`` or
+  ``{"rows": [], "note": "..."}`` so the agent can recover.
+* Analysis tools validate the handle's schema (column exists, dtype is
+  numeric where required) and return a clear error on misapplication.
 """
 
 from __future__ import annotations
@@ -29,13 +34,15 @@ from decimal import Decimal
 from typing import Any, Awaitable, Callable
 
 import asyncpg
+import pandas as pd
 
-from . import db
+from . import datasets, db
+from .datasets import DatasetError, DatasetRegistry, scalar
 
 logger = logging.getLogger(__name__)
 
 
-# ── JSON serialisation ─────────────────────────────────────────────────
+# ── Serialisation helpers ──────────────────────────────────────────────
 
 
 def _json_safe(o: Any) -> Any:
@@ -54,7 +61,17 @@ def _json_safe(o: Any) -> Any:
     return str(o)
 
 
-# ── 1. headline_search ─────────────────────────────────────────────────
+def _records_to_frame(rows: list[asyncpg.Record]) -> pd.DataFrame:
+    """asyncpg records → DataFrame, coercing NUMERIC (Decimal) columns to float."""
+    df = pd.DataFrame([dict(r) for r in rows])
+    for col in df.columns:
+        non_null = df[col].dropna()
+        if not non_null.empty and isinstance(non_null.iloc[0], Decimal):
+            df[col] = df[col].astype("float64")
+    return df
+
+
+# ── Inline tool 1: headline_search ─────────────────────────────────────
 
 
 async def headline_search(
@@ -63,21 +80,20 @@ async def headline_search(
     ticker: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
-    limit: int = 20,
+    limit: int = 25,
 ) -> dict:
     """FTS over headlines with optional filters.
 
-    ``source``: ``'abc' | 'analyst' | 'partner' | 'all'``.
-    Returns highest-ts_rank rows up to ``limit`` (max 100).
+    ``source``: ``'abc' | 'analyst' | 'partner' | 'all'``. Returns the
+    highest-ts_rank rows up to ``limit`` (max 50) — the agent reads these
+    directly, so the cap is small on purpose.
     """
-    limit = max(1, min(int(limit), 100))
+    limit = max(1, min(int(limit), 50))
     source = (source or "all").lower()
     pool = db.writer()
-
     results: list[dict] = []
 
     if source in ("abc", "all") and not ticker:
-        # ABC has no ticker column; skip when caller filters by ticker.
         rows = await pool.fetch(
             """
             SELECT 'abc' AS source,
@@ -128,7 +144,6 @@ async def headline_search(
         )
         results.extend(_json_safe(rows))
 
-    # Re-sort the merged list by rank when querying 'all'.
     results.sort(key=lambda r: r.get("rank") or 0, reverse=True)
     results = results[:limit]
     if not results:
@@ -139,7 +154,7 @@ async def headline_search(
     return {"rows": results, "count": len(results)}
 
 
-# ── 2. headline_topic_frequency ────────────────────────────────────────
+# ── Inline tool 2: headline_topic_frequency ────────────────────────────
 
 
 async def headline_topic_frequency(
@@ -156,7 +171,6 @@ async def headline_topic_frequency(
     if granularity not in ("day", "week", "month", "year"):
         return {"error": f"invalid granularity {granularity!r}; use day|week|month|year"}
     source = (source or "all").lower()
-
     parts: list[asyncpg.Record] = []
     pool = db.writer()
 
@@ -203,10 +217,21 @@ async def headline_topic_frequency(
 
     if not parts:
         return {"rows": [], "note": "no matches in range"}
-    return {"rows": _json_safe(parts), "granularity": granularity, "source": source}
+    result: dict[str, Any] = {
+        "rows": _json_safe(parts),
+        "granularity": granularity,
+        "source": source,
+        "count": len(parts),
+    }
+    if len(parts) > 120:
+        result["hint"] = (
+            "many buckets returned — use a coarser granularity "
+            "(week/month/year) or a narrower date range"
+        )
+    return result
 
 
-# ── 3. lookup_security ─────────────────────────────────────────────────
+# ── Inline tool 3: lookup_security ─────────────────────────────────────
 
 
 async def lookup_security(name_or_ticker: str) -> dict:
@@ -229,51 +254,30 @@ async def lookup_security(name_or_ticker: str) -> dict:
     return {"rows": _json_safe(rows), "count": len(rows)}
 
 
-# ── 4. price_history ───────────────────────────────────────────────────
+# ── Loader 1: load_prices ──────────────────────────────────────────────
 
 
-async def price_history(ticker: str, start_date: str, end_date: str) -> dict:
-    """Daily OHLCV for a ticker over an inclusive date range."""
-    pool = db.writer()
-    rows = await pool.fetch(
-        """
-        SELECT date::text AS date, open, high, low, close, volume
-        FROM prices
-        WHERE ticker = upper($1) AND date BETWEEN $2::date AND $3::date
-        ORDER BY date
-        """,
-        ticker,
-        start_date,
-        end_date,
-    )
-    if not rows:
-        return {
-            "rows": [],
-            "note": f"no price rows for {ticker} in {start_date}..{end_date} (data ends 2016-12-30)",
-        }
-    return {"rows": _json_safe(rows), "count": len(rows), "ticker": ticker.upper()}
+async def load_prices(
+    registry: DatasetRegistry, ticker: str, start_date: str, end_date: str
+) -> dict:
+    """Load daily OHLCV + a derived ``daily_return`` column into a dataset.
 
-
-# ── 5. returns ─────────────────────────────────────────────────────────
-
-
-async def returns(ticker: str, start_date: str, end_date: str) -> dict:
-    """Daily close-to-close pct returns for a ticker."""
+    Returns a handle + shape/schema/head — not the rows. Run the
+    ``dataset_*`` analysis tools on the handle.
+    """
     pool = db.writer()
     rows = await pool.fetch(
         """
         WITH p AS (
-            SELECT date, close,
+            SELECT date, open, high, low, close, volume,
                    LAG(close) OVER (ORDER BY date) AS prev_close
             FROM prices
             WHERE ticker = upper($1) AND date BETWEEN $2::date AND $3::date
         )
-        SELECT date::text AS date,
-               close,
+        SELECT date::text AS date, open, high, low, close, volume,
                CASE WHEN prev_close IS NULL OR prev_close = 0 THEN NULL
-                    ELSE (close - prev_close) / prev_close END AS return_pct
+                    ELSE (close - prev_close) / prev_close END AS daily_return
         FROM p
-        WHERE prev_close IS NOT NULL
         ORDER BY date
         """,
         ticker,
@@ -281,142 +285,261 @@ async def returns(ticker: str, start_date: str, end_date: str) -> dict:
         end_date,
     )
     if not rows:
-        return {"rows": [], "note": f"no returns for {ticker} in range"}
-    return {"rows": _json_safe(rows), "count": len(rows), "ticker": ticker.upper()}
+        return {
+            "error": f"no price rows for {ticker} in {start_date}..{end_date} "
+            "(price data covers 2010-01-04 .. 2016-12-30)"
+        }
+    df = _records_to_frame(rows)
+    handle = registry.put(df)
+    meta = registry.describe(handle)
+    meta["loaded"] = f"daily prices for {ticker.upper()}, {start_date}..{end_date}"
+    return meta
 
 
-# ── 6. forecast_returns (ARIMA) ────────────────────────────────────────
+# ── Loader 2: load_dataset_sql ─────────────────────────────────────────
 
 
-async def forecast_returns(ticker: str, horizon: int = 10) -> dict:
-    """ARIMA(1,0,1) forecast of next-N daily returns.
+_SQL_PREFIXES = ("SELECT", "WITH")
 
-    Fits on all available history for the ticker. Naive baseline — call
-    out the limitations when surfacing to users.
+
+async def load_dataset_sql(registry: DatasetRegistry, query: str) -> dict:
+    """Run a read-only SQL query and load the result into a dataset.
+
+    SELECT / WITH only. Use this for joins, aggregations, or any shape the
+    structured loaders don't cover (e.g. daily headline counts joined to
+    prices for a correlation). Returns a handle, not rows.
     """
-    horizon = max(1, min(int(horizon), 30))
-    pool = db.writer()
-    rows = await pool.fetch(
-        """
-        WITH p AS (
-            SELECT date, close, LAG(close) OVER (ORDER BY date) AS prev_close
-            FROM prices WHERE ticker = upper($1)
-        )
-        SELECT date::text AS date,
-               (close - prev_close) / prev_close AS r
-        FROM p
-        WHERE prev_close IS NOT NULL AND prev_close <> 0
-        ORDER BY date
-        """,
-        ticker,
+    q = (query or "").strip().rstrip(";")
+    if not q:
+        return {"error": "empty query"}
+    if not q.upper().lstrip("(").startswith(_SQL_PREFIXES):
+        return {"error": "only SELECT or WITH queries are permitted"}
+    cap = int(os.environ.get("AGENT_DATASET_MAX_ROWS", "200000"))
+    wrapped = f"SELECT * FROM (\n{q}\n) _wrapped LIMIT {cap + 1}"
+    try:
+        async with db.reader().acquire() as conn:
+            records = await conn.fetch(wrapped)
+    except Exception as exc:
+        return {"error": str(exc)}
+    if not records:
+        return {"error": "query returned 0 rows"}
+    truncated = len(records) > cap
+    if truncated:
+        records = records[:cap]
+    df = _records_to_frame(records)
+    handle = registry.put(df)
+    meta = registry.describe(
+        handle,
+        truncated=truncated,
+        total_rows=None,
+        note=(
+            (
+                f"query returned more than {cap} rows; loaded the first {cap}. "
+                "Add aggregation or a tighter filter."
+            )
+            if truncated
+            else None
+        ),
     )
-    if not rows:
-        return {"error": f"no price history for {ticker}"}
-    series = [float(r["r"]) for r in rows]
-    if len(series) < 30:
-        return {"error": f"insufficient history ({len(series)} rows) to fit ARIMA"}
+    meta["loaded"] = "sql query result"
+    return meta
 
-    def _fit_and_forecast() -> dict:
-        # Lazy import — statsmodels is heavy. Only the forecast tool needs it.
+
+# ── Analysis: dataset_describe ─────────────────────────────────────────
+
+
+async def dataset_describe(registry: DatasetRegistry, handle: str) -> dict:
+    """Per-column summary statistics for a loaded dataset (pandas describe)."""
+    try:
+        df = registry.get(handle)
+    except DatasetError as exc:
+        return {"error": str(exc)}
+    try:
+        desc = df.describe(include="all")
+    except Exception as exc:
+        return {"error": f"could not describe dataset: {exc}"}
+    stats: dict[str, dict] = {}
+    for col in desc.columns:
+        col_stats = {}
+        for stat in desc.index:
+            val = scalar(desc.loc[stat, col])
+            if val is not None:
+                col_stats[str(stat)] = val
+        stats[str(col)] = col_stats
+    return {"handle": handle, "n_rows": int(len(df)), "stats": stats}
+
+
+# ── Analysis: dataset_sample ───────────────────────────────────────────
+
+
+async def dataset_sample(
+    registry: DatasetRegistry,
+    handle: str,
+    n: int = 10,
+    sort_by: str | None = None,
+    descending: bool = False,
+) -> dict:
+    """Return a small bounded slice of actual rows (e.g. the 5 worst days).
+
+    ``n`` is capped at AGENT_DATASET_SAMPLE_MAX. Optionally sort by a column
+    first — the only way raw rows reach the agent, always bounded.
+    """
+    try:
+        df = registry.get(handle)
+    except DatasetError as exc:
+        return {"error": str(exc)}
+    cap = int(os.environ.get("AGENT_DATASET_SAMPLE_MAX", "50"))
+    n = max(1, min(int(n), cap))
+    view = df
+    if sort_by is not None:
+        if sort_by not in df.columns:
+            return {"error": f"column {sort_by!r} not in dataset; columns: {list(df.columns)}"}
+        view = df.sort_values(sort_by, ascending=not descending)
+    return {
+        "handle": handle,
+        "rows": datasets.frame_records(view.head(n)),
+        "row_count": min(n, len(df)),
+        "total_rows": int(len(df)),
+        "sorted_by": sort_by,
+        "descending": descending if sort_by else None,
+    }
+
+
+# ── Analysis: dataset_rolling ──────────────────────────────────────────
+
+
+async def dataset_rolling(
+    registry: DatasetRegistry,
+    handle: str,
+    column: str,
+    window: int,
+    op: str = "mean",
+) -> dict:
+    """Rolling statistic over a numeric column → stored as a NEW dataset.
+
+    ``op``: ``mean | std | min | max | sum``. The result frame is the source
+    plus a ``<column>_rolling_<op>_<window>`` column; returns its handle.
+    """
+    try:
+        df = registry.get(handle)
+    except DatasetError as exc:
+        return {"error": str(exc)}
+    if column not in df.columns:
+        return {"error": f"column {column!r} not in dataset; columns: {list(df.columns)}"}
+    if not pd.api.types.is_numeric_dtype(df[column]):
+        return {
+            "error": f"column {column!r} is {df[column].dtype}, not numeric — "
+            "rolling stats need a numeric column"
+        }
+    if op not in ("mean", "std", "min", "max", "sum"):
+        return {"error": f"invalid op {op!r}; use mean|std|min|max|sum"}
+    window = max(2, int(window))
+    out = df.copy()
+    out_col = f"{column}_rolling_{op}_{window}"
+    out[out_col] = getattr(df[column].rolling(window), op)()
+    new_handle = registry.put(out)
+    meta = registry.describe(new_handle)
+    meta["derived"] = f"rolling {op} (window={window}) of {column!r} → column {out_col!r}"
+    return meta
+
+
+# ── Analysis: dataset_correlation ──────────────────────────────────────
+
+
+async def dataset_correlation(
+    registry: DatasetRegistry, handle: str, col_a: str, col_b: str
+) -> dict:
+    """Pearson correlation between two numeric columns of one dataset.
+
+    For cross-dataset correlation, load a single joined frame via
+    ``load_dataset_sql`` (join in SQL on date), then correlate within it.
+    """
+    try:
+        df = registry.get(handle)
+    except DatasetError as exc:
+        return {"error": str(exc)}
+    for c in (col_a, col_b):
+        if c not in df.columns:
+            return {"error": f"column {c!r} not in dataset; columns: {list(df.columns)}"}
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            return {
+                "error": f"column {c!r} is {df[c].dtype}, not numeric — "
+                "correlation needs numeric columns"
+            }
+    pair = df[[col_a, col_b]].dropna()
+    if len(pair) < 3:
+        return {"error": f"only {len(pair)} rows with both columns present — too few"}
+    return {
+        "handle": handle,
+        "col_a": col_a,
+        "col_b": col_b,
+        "pearson_r": scalar(pair[col_a].corr(pair[col_b])),
+        "n": int(len(pair)),
+    }
+
+
+# ── Analysis: dataset_arima ────────────────────────────────────────────
+
+
+async def dataset_arima(
+    registry: DatasetRegistry, handle: str, column: str, horizon: int = 10
+) -> dict:
+    """ARIMA(1,0,1) forecast of the next ``horizon`` values of a numeric column.
+
+    Naive baseline — not a research-grade forecast.
+    """
+    try:
+        df = registry.get(handle)
+    except DatasetError as exc:
+        return {"error": str(exc)}
+    if column not in df.columns:
+        return {"error": f"column {column!r} not in dataset; columns: {list(df.columns)}"}
+    if not pd.api.types.is_numeric_dtype(df[column]):
+        return {
+            "error": f"column {column!r} is {df[column].dtype}, not numeric — "
+            "ARIMA needs a numeric series"
+        }
+    series = [float(x) for x in df[column].dropna().tolist()]
+    if len(series) < 30:
+        return {"error": f"only {len(series)} non-null values — need >=30 to fit ARIMA"}
+    horizon = max(1, min(int(horizon), 30))
+
+    def _fit() -> dict:
+        # Lazy import — statsmodels is heavy.
         from statsmodels.tsa.arima.model import ARIMA
 
-        model = ARIMA(series, order=(1, 0, 1))
-        fitted = model.fit()
-        forecast = fitted.get_forecast(steps=horizon)
-        mean = forecast.predicted_mean
-        ci = forecast.conf_int(alpha=0.05)
+        fitted = ARIMA(series, order=(1, 0, 1)).fit()
+        fc = fitted.get_forecast(steps=horizon)
+        ci = fc.conf_int(alpha=0.05)
         return {
-            "mean": [float(x) for x in mean],
+            "mean": [float(x) for x in fc.predicted_mean],
             "lower_95": [float(row[0]) for row in ci],
             "upper_95": [float(row[1]) for row in ci],
             "aic": float(fitted.aic),
         }
 
     try:
-        fit = await asyncio.to_thread(_fit_and_forecast)
+        fit = await asyncio.to_thread(_fit)
     except Exception as exc:
         return {"error": f"ARIMA fit failed: {exc}"}
-
     return {
-        "ticker": ticker.upper(),
+        "handle": handle,
+        "column": column,
         "horizon": horizon,
-        "history_rows": len(series),
-        "last_observed_date": rows[-1]["date"].isoformat(),
+        "history_points": len(series),
         "forecast": [
             {
                 "step": i + 1,
-                "predicted_return": fit["mean"][i],
+                "predicted": fit["mean"][i],
                 "lower_95": fit["lower_95"][i],
                 "upper_95": fit["upper_95"][i],
             }
             for i in range(horizon)
         ],
-        "model": "ARIMA(1,0,1) on raw daily returns",
+        "model": "ARIMA(1,0,1)",
         "aic": fit["aic"],
         "caveat": "naive baseline; not a research-grade forecast",
     }
-
-
-# ── 7. fundamentals_lookup ─────────────────────────────────────────────
-
-
-async def fundamentals_lookup(ticker: str, metric: str, as_of: str | None = None) -> dict:
-    """Pull a fundamental metric from the JSONB `data` column.
-
-    Returns all available period-ends for the metric, or just the one
-    matching ``as_of`` if supplied. Use the exact metric name as it
-    appears in the source (e.g. ``"Total Revenue"``).
-    """
-    pool = db.writer()
-    rows = await pool.fetch(
-        """
-        SELECT period_end::text AS period_end,
-               for_year,
-               data->>$2 AS value
-        FROM fundamentals
-        WHERE ticker = upper($1)
-          AND ($3::date IS NULL OR period_end = $3::date)
-          AND data ? $2
-        ORDER BY period_end DESC
-        """,
-        ticker,
-        metric,
-        as_of,
-    )
-    if not rows:
-        return {
-            "rows": [],
-            "note": f"no fundamentals for {ticker}/{metric!r}; check the metric name spelling",
-        }
-    return {"rows": _json_safe(rows), "ticker": ticker.upper(), "metric": metric}
-
-
-# ── 8. sql (read-only escape hatch) ────────────────────────────────────
-
-
-_SQL_PREFIXES = ("SELECT", "WITH")
-
-
-async def sql(query: str) -> dict:
-    """Run a read-only SQL query. SELECT/WITH only; row cap and timeout apply."""
-    q = (query or "").strip().rstrip(";")
-    if not q:
-        return {"error": "empty query"}
-    if not q.upper().lstrip("(").startswith(_SQL_PREFIXES):
-        return {"error": "only SELECT or WITH queries are permitted via this tool"}
-    cap = int(os.environ.get("AGENT_SQL_ROW_CAP", "1000"))
-    try:
-        async with db.reader().acquire() as conn:
-            records = await conn.fetch(q)
-    except Exception as exc:
-        return {"error": str(exc)}
-    truncated = len(records) > cap
-    records = records[:cap]
-    if not records:
-        return {"columns": [], "rows": [], "truncated": False, "note": "0 rows"}
-    columns = list(records[0].keys())
-    rows = [[_json_safe(v) for v in r.values()] for r in records]
-    return {"columns": columns, "rows": rows, "truncated": truncated, "row_count": len(rows)}
 
 
 # ── Registry ───────────────────────────────────────────────────────────
@@ -428,9 +551,9 @@ TOOL_DEFINITIONS: list[dict] = [
         "function": {
             "name": "headline_search",
             "description": (
-                "Full-text search over the headline corpora. Supports filtering by source "
-                "(`abc`, `analyst`, `partner`, or `all`), by ticker (US sources only), and "
-                "by date range. Ranked by ts_rank; returns at most 100 rows."
+                "Full-text search over the headline corpora; returns the matching "
+                "headline text directly (at most 50 rows). Filter by source "
+                "(`abc`, `analyst`, `partner`, `all`), ticker (US sources only), and date range."
             ),
             "parameters": {
                 "type": "object",
@@ -446,11 +569,11 @@ TOOL_DEFINITIONS: list[dict] = [
                     },
                     "ticker": {
                         "type": "string",
-                        "description": "Filter to a specific ticker (US sources only).",
+                        "description": "Filter to a ticker (US sources only).",
                     },
-                    "start_date": {"type": "string", "description": "ISO YYYY-MM-DD, inclusive."},
-                    "end_date": {"type": "string", "description": "ISO YYYY-MM-DD, inclusive."},
-                    "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+                    "start_date": {"type": "string", "description": "ISO YYYY-MM-DD."},
+                    "end_date": {"type": "string", "description": "ISO YYYY-MM-DD."},
+                    "limit": {"type": "integer", "default": 25, "minimum": 1, "maximum": 50},
                 },
                 "required": ["query"],
             },
@@ -486,12 +609,10 @@ TOOL_DEFINITIONS: list[dict] = [
         "type": "function",
         "function": {
             "name": "lookup_security",
-            "description": "Find S&P 500 securities by ticker symbol (exact) or company name (fuzzy ILIKE).",
+            "description": "Find S&P 500 securities by ticker symbol (exact) or company name (fuzzy).",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "name_or_ticker": {"type": "string"},
-                },
+                "properties": {"name_or_ticker": {"type": "string"}},
                 "required": ["name_or_ticker"],
             },
         },
@@ -499,8 +620,12 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "price_history",
-            "description": "Daily OHLCV for a ticker, split-adjusted, between start_date and end_date (inclusive). Data ends 2016-12-30.",
+            "name": "load_prices",
+            "description": (
+                "Load a ticker's daily OHLCV + derived `daily_return` into a dataset. "
+                "Returns a handle + shape/schema/head sample, NOT the rows. Then use the "
+                "dataset_* analysis tools on the handle. Price data covers 2010-01-04..2016-12-30."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -515,68 +640,12 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "returns",
-            "description": "Daily close-to-close pct returns for a ticker over a date range.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string"},
-                    "start_date": {"type": "string"},
-                    "end_date": {"type": "string"},
-                },
-                "required": ["ticker", "start_date", "end_date"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "forecast_returns",
+            "name": "load_dataset_sql",
             "description": (
-                "ARIMA(1,0,1) forecast of next-N daily returns for a ticker. "
-                "Fitted on all available history. Naive baseline — not a research-grade forecast."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string"},
-                    "horizon": {"type": "integer", "default": 10, "minimum": 1, "maximum": 30},
-                },
-                "required": ["ticker"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fundamentals_lookup",
-            "description": (
-                "Pull a specific fundamental metric for a ticker from the JSONB `data` column. "
-                "Use the exact metric name as it appears in the source CSV "
-                "(e.g. 'Total Revenue', 'Net Income', 'Earnings Per Share')."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "ticker": {"type": "string"},
-                    "metric": {"type": "string"},
-                    "as_of": {
-                        "type": "string",
-                        "description": "Filter to a specific period_end (ISO YYYY-MM-DD). Optional.",
-                    },
-                },
-                "required": ["ticker", "metric"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "sql",
-            "description": (
-                "Read-only escape hatch for queries the structured tools don't cover. "
-                "SELECT or WITH only. Row cap and statement timeout apply. "
-                "Use sparingly — prefer the structured tools when one fits."
+                "Run a read-only SQL query (SELECT/WITH only) and load the result into a "
+                "dataset; returns a handle, not rows. Use for joins/aggregations the structured "
+                "loaders don't cover — e.g. daily headline counts joined to prices for a "
+                "correlation. Then use the dataset_* analysis tools on the handle."
             ),
             "parameters": {
                 "type": "object",
@@ -584,9 +653,107 @@ TOOL_DEFINITIONS: list[dict] = [
                     "query": {
                         "type": "string",
                         "description": "A SELECT or WITH ... SELECT query.",
-                    },
+                    }
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dataset_describe",
+            "description": "Per-column summary statistics (count, mean, std, min/max, quartiles) for a loaded dataset.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string", "description": "A dataset handle, e.g. ds_1."}
+                },
+                "required": ["handle"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dataset_sample",
+            "description": (
+                "Return a small bounded slice of actual rows from a dataset (max 50). "
+                "Optionally sort by a column first — e.g. sort by daily_return ascending "
+                "for the worst days. The only way raw rows reach you; always bounded."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string"},
+                    "n": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
+                    "sort_by": {
+                        "type": "string",
+                        "description": "Column to sort by before sampling.",
+                    },
+                    "descending": {"type": "boolean", "default": False},
+                },
+                "required": ["handle"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dataset_rolling",
+            "description": (
+                "Compute a rolling statistic over a numeric column. Produces a NEW dataset "
+                "(source + the rolling column) and returns its handle."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string"},
+                    "column": {"type": "string"},
+                    "window": {"type": "integer", "description": "Rolling window size (>=2)."},
+                    "op": {
+                        "type": "string",
+                        "enum": ["mean", "std", "min", "max", "sum"],
+                        "default": "mean",
+                    },
+                },
+                "required": ["handle", "column", "window"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dataset_correlation",
+            "description": "Pearson correlation between two numeric columns of one dataset.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string"},
+                    "col_a": {"type": "string"},
+                    "col_b": {"type": "string"},
+                },
+                "required": ["handle", "col_a", "col_b"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dataset_arima",
+            "description": (
+                "ARIMA(1,0,1) forecast of the next N values of a numeric column in a dataset. "
+                "Naive baseline — not a research-grade forecast. There is no support for other "
+                "models (LSTM, XGBoost, etc.); decline such requests rather than improvising."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string"},
+                    "column": {"type": "string", "description": "Numeric column to forecast."},
+                    "horizon": {"type": "integer", "default": 10, "minimum": 1, "maximum": 30},
+                },
+                "required": ["handle", "column"],
             },
         },
     },
@@ -599,23 +766,42 @@ _DISPATCH: dict[str, _ToolFn] = {
     "headline_search": headline_search,
     "headline_topic_frequency": headline_topic_frequency,
     "lookup_security": lookup_security,
-    "price_history": price_history,
-    "returns": returns,
-    "forecast_returns": forecast_returns,
-    "fundamentals_lookup": fundamentals_lookup,
-    "sql": sql,
+    "load_prices": load_prices,
+    "load_dataset_sql": load_dataset_sql,
+    "dataset_describe": dataset_describe,
+    "dataset_sample": dataset_sample,
+    "dataset_rolling": dataset_rolling,
+    "dataset_correlation": dataset_correlation,
+    "dataset_arima": dataset_arima,
+}
+
+# Tools that operate on the per-run dataset registry — dispatch injects it.
+_REGISTRY_TOOLS = {
+    "load_prices",
+    "load_dataset_sql",
+    "dataset_describe",
+    "dataset_sample",
+    "dataset_rolling",
+    "dataset_correlation",
+    "dataset_arima",
 }
 
 
-async def dispatch(name: str, args: dict) -> dict:
-    """Run the named tool. Returns a JSON-serialisable dict (or an error dict)."""
+async def dispatch(name: str, args: dict, registry: DatasetRegistry) -> dict:
+    """Run the named tool. Returns a JSON-serialisable dict (or an error dict).
+
+    Registry-aware tools (loaders + analysis) receive ``registry`` as their
+    first argument; inline tools do not.
+    """
     fn = _DISPATCH.get(name)
     if fn is None:
         return {"error": f"unknown tool: {name}"}
     try:
+        if name in _REGISTRY_TOOLS:
+            return await fn(registry, **(args or {}))
         return await fn(**(args or {}))
     except TypeError as exc:
-        # Bad argument shape — surface it back to the model so it can correct.
+        # Bad argument shape — surface it so the model can correct.
         return {"error": f"argument error: {exc}"}
     except Exception as exc:
         logger.exception("tool %s failed", name)

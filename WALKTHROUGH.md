@@ -81,8 +81,8 @@ When you run `python agent.py "task"`:
 4. Then it loops:
    - **Maybe compact.** If the conversation has grown past a token
      threshold, older turns are summarized down (see below).
-   - **Call the model.** LiteLLM sends the conversation plus the list
-     of 8 tool definitions to Claude.
+   - **Call the model.** LiteLLM sends the conversation plus the tool
+     definitions to Claude.
    - **Branch.** If the model replied with no tool calls, it has an
      answer — the loop returns it. If it asked to call tools, the loop
      dispatches each one, appends the results to the conversation, and
@@ -95,31 +95,52 @@ When you run `python agent.py "task"`:
 5. The service returns the answer plus a run summary (turn count,
    tokens, cost) to the CLI, which prints it.
 
-## The 8 tools
+## The tools — load then analyze
 
-Tools are how the agent actually *uses the data*. Each is an async
-Python function in `service/tools.py` with a JSON schema the model
-sees. Seven are structured and scoped; the eighth is an escape hatch.
+Tools are how the agent *uses the data*. Each is an async Python function
+in `service/tools.py` with a JSON schema the model sees. They come in
+three kinds.
+
+**Inline tools** return small results directly:
 
 | Tool | What it does |
 |---|---|
-| `headline_search` | Full-text search across the headline corpora, with date/ticker/source filters |
+| `headline_search` | Full-text search across the headline corpora; returns matching headline text (≤50 rows) |
 | `headline_topic_frequency` | Counts of matching headlines bucketed by day/week/month/year |
 | `lookup_security` | Find a ticker by company name or symbol |
-| `price_history` | Daily OHLCV for a ticker over a date range |
-| `returns` | Daily close-to-close percentage returns |
-| `forecast_returns` | A naive ARIMA forecast of next-N daily returns |
-| `fundamentals_lookup` | Pull a named metric (e.g. "Total Revenue") from the JSONB fundamentals |
-| `sql` | Read-only SELECT/WITH escape hatch for anything the above don't cover |
 
-Full-text search uses Postgres `tsvector` with GIN indexes — real
-keyword search with stemming and ranking, not `LIKE` scans.
+**Loaders** pull a potentially large result set into a server-side pandas
+DataFrame and return only a *handle* (`ds_1`) + the dataset's shape,
+columns, and a tiny head sample — never the bulk rows:
 
-The `sql()` tool is deliberately constrained: it runs through a
-separate **read-only database role**, with a per-connection statement
-timeout and a row cap on results. Even if the model writes a wild
-query, it cannot write data, cannot run forever, and cannot return an
-unbounded result.
+| Tool | What it does |
+|---|---|
+| `load_prices` | A ticker's daily OHLCV + a derived `daily_return` column |
+| `load_dataset_sql` | A read-only SELECT/WITH query — for joins/aggregations the loaders don't cover |
+
+**Analysis tools** operate on a handle and return small results:
+
+| Tool | What it does |
+|---|---|
+| `dataset_describe` | Per-column summary statistics |
+| `dataset_sample` | A small bounded slice of actual rows, optionally sorted |
+| `dataset_rolling` | A rolling statistic over a numeric column (yields a new handle) |
+| `dataset_correlation` | Pearson correlation between two numeric columns |
+| `dataset_arima` | ARIMA(1,0,1) forecast of a numeric column — a naive baseline |
+
+Why the split: a multi-year price history is tens of thousands of tokens
+of raw rows. Rather than dump that into the model's context (or truncate
+it and lose data), heavy data is **loaded server-side** and the agent
+works on a handle. Large tool results become structurally impossible —
+see DECISIONS.md. The analysis menu is fixed: requests outside it (fit an
+LSTM, train XGBoost) have no tool, and the agent declines them rather than
+improvising.
+
+Full-text search uses Postgres `tsvector` with GIN indexes — real keyword
+search with stemming and ranking, not `LIKE` scans. `load_dataset_sql`
+runs through a separate **read-only database role** with a per-connection
+statement timeout, and wraps the query in an outer `LIMIT` — even a wild
+query cannot write data, run forever, or exhaust memory.
 
 ## Context compaction
 
@@ -159,11 +180,12 @@ never break the actual agent run.
 ```
 docker-compose.yml      the four services, wired together
 db/01-schema.sql        tables, GIN full-text indexes, traces table
-db/02-setup-roles.sh    the read-only role for the sql() tool
+db/02-setup-roles.sh    the read-only role for load_dataset_sql
 ingest/ingest.py        streamed CSV → Postgres
 service/main.py         FastAPI app — POST /run, GET /healthz
 service/loop.py         the agent loop (the heart of it)
-service/tools.py        the 8 tools + dispatcher
+service/tools.py        the tool registry + dispatcher
+service/datasets.py     the per-run dataset registry (handles)
 service/compaction.py   context compaction
 service/telemetry.py    LiteLLM → traces callback
 service/db.py           the writer + reader connection pools
