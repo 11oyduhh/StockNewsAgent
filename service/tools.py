@@ -26,6 +26,7 @@ Conventions:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -785,6 +786,35 @@ _REGISTRY_TOOLS = {
     "dataset_correlation",
     "dataset_arima",
 }
+
+
+def _validate_registry_tools() -> None:
+    """Fail fast at import if _REGISTRY_TOOLS disagrees with the tool signatures.
+
+    A registry-aware tool whose name is missing from _REGISTRY_TOOLS would
+    otherwise only fail when the agent first calls it — ``dispatch`` would call
+    it without the injected ``registry``, raising a missing-argument
+    ``TypeError`` mid-run. Validating here means a misconfigured registry stops
+    the service from starting, before any agent interaction.
+    """
+    needs_registry = {
+        name
+        for name, fn in _DISPATCH.items()
+        if next(iter(inspect.signature(fn).parameters), None) == "registry"
+    }
+    if needs_registry != _REGISTRY_TOOLS:
+        missing = sorted(needs_registry - _REGISTRY_TOOLS)
+        extra = sorted(_REGISTRY_TOOLS - needs_registry)
+        problems = []
+        if missing:
+            problems.append(f"missing from _REGISTRY_TOOLS (they take `registry`): {missing}")
+        if extra:
+            problems.append(f"in _REGISTRY_TOOLS but take no `registry` arg: {extra}")
+        raise RuntimeError("tool registry misconfigured — " + "; ".join(problems))
+
+
+# Runs at import — i.e. at service startup, before any request is served.
+_validate_registry_tools()
 
 
 async def dispatch(name: str, args: dict, registry: DatasetRegistry) -> dict:
