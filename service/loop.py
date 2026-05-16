@@ -21,6 +21,10 @@ never got a turn to consume the last tool result. A final tool-free
 not a hard cap on LLM calls — a capped run makes one extra synthesis
 call (worst case: budget + 1 calls).
 
+Each run owns a :class:`~service.datasets.DatasetRegistry` — heavy tools
+load query results into it server-side and the agent works on handles, so
+bulk rows never enter the context. The registry is cleared when the run ends.
+
 Returns an :class:`AgentResult` with the answer plus a small run summary
 (turns, tokens, cost, compactions, whether the round cap fired).
 """
@@ -37,7 +41,7 @@ from uuid import UUID, uuid4
 
 import litellm
 
-from . import compaction, db, tools
+from . import compaction, datasets, db, tools
 from .prompts import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -87,6 +91,10 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
     max_rounds_with_tool_calls = max(1, max_rounds_with_tool_calls)
     cfg = _config_from_env()
 
+    # Per-run dataset store — heavy tools load into it, analysis tools read it,
+    # and it is cleared in the finally below so memory is bounded to the run.
+    registry = datasets.DatasetRegistry()
+
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": task},
@@ -98,137 +106,142 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
     compactions = 0
     final_text = ""
 
-    for turn in range(max_rounds_with_tool_calls):
-        # ── Maybe compact before this call ────────────────────────────
-        if compaction.should_compact(messages, cumulative_input, cfg):
-            result = compaction.compact_messages(messages, cfg)
-            if result.removed_count > 0:
-                messages = result.messages
-                compactions += 1
-                logger.info(
-                    "task=%s turn=%d compacted removed=%d saved=%d walk_back=%d",
-                    task_id,
-                    turn,
-                    result.removed_count,
-                    result.estimated_tokens_saved,
-                    result.walk_back_steps,
+    try:
+        for turn in range(max_rounds_with_tool_calls):
+            # ── Maybe compact before this call ────────────────────────
+            if compaction.should_compact(messages, cumulative_input, cfg):
+                result = compaction.compact_messages(messages, cfg)
+                if result.removed_count > 0:
+                    messages = result.messages
+                    compactions += 1
+                    logger.info(
+                        "task=%s turn=%d compacted removed=%d saved=%d walk_back=%d",
+                        task_id,
+                        turn,
+                        result.removed_count,
+                        result.estimated_tokens_saved,
+                        result.walk_back_steps,
+                    )
+
+            # ── LLM call ──────────────────────────────────────────────
+            response = await litellm.acompletion(
+                model=model,
+                messages=messages,
+                tools=tools.TOOL_DEFINITIONS,
+                tool_choice="auto",
+                metadata={"task_id": task_id, "turn_index": turn},
+            )
+
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                cumulative_input += int(getattr(usage, "prompt_tokens", 0) or 0)
+                total_output += int(getattr(usage, "completion_tokens", 0) or 0)
+            total_cost += _response_cost(response)
+
+            msg = response.choices[0].message
+
+            # Build the assistant message dict to append to history.
+            assistant_dict: dict[str, Any] = {"role": "assistant"}
+            if msg.content is not None:
+                assistant_dict["content"] = msg.content
+            if getattr(msg, "tool_calls", None):
+                assistant_dict["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+            messages.append(assistant_dict)
+
+            # ── Done if no tool calls ─────────────────────────────────
+            if not getattr(msg, "tool_calls", None):
+                final_text = msg.content or ""
+                return AgentResult(
+                    answer=final_text,
+                    task_id=task_id,
+                    turns=turn + 1,
+                    input_tokens=cumulative_input,
+                    output_tokens=total_output,
+                    cost_usd=total_cost,
+                    compactions=compactions,
+                    hit_round_cap=False,
                 )
 
-        # ── LLM call ──────────────────────────────────────────────────
+            # ── Dispatch each tool call, persist trace, append result ─
+            for tc in msg.tool_calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+
+                t0 = time.time()
+                tool_result = await tools.dispatch(name, args, registry)
+                latency_ms = int((time.time() - t0) * 1000)
+
+                try:
+                    await db.writer().execute(
+                        """
+                        INSERT INTO traces
+                            (task_id, turn_index, kind, model,
+                             tool_name, tool_input, tool_output, latency_ms, error)
+                        VALUES ($1, $2, 'tool_call', $3, $4,
+                                $5::jsonb, $6::jsonb, $7, $8)
+                        """,
+                        UUID(task_id),
+                        turn,
+                        model,
+                        name,
+                        json.dumps(args, default=str),
+                        json.dumps(tool_result, default=str)[:1_000_000],  # safety cap
+                        latency_ms,
+                        tool_result.get("error") if isinstance(tool_result, dict) else None,
+                    )
+                except Exception as exc:
+                    # Never fail the agent loop on a trace write.
+                    logger.warning("tool_call trace write failed: %s", exc)
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": name,
+                        "content": tools.tool_result_text(tool_result),
+                    }
+                )
+
+        # Round budget exhausted with tool results still pending — the model
+        # never got a turn to consume the last one. One tool-free call lets it
+        # synthesize a final answer from the conversation history it already
+        # has. ``tools`` is omitted entirely so the response can only be text.
         response = await litellm.acompletion(
             model=model,
             messages=messages,
-            tools=tools.TOOL_DEFINITIONS,
-            tool_choice="auto",
-            metadata={"task_id": task_id, "turn_index": turn},
+            metadata={"task_id": task_id, "turn_index": max_rounds_with_tool_calls},
         )
-
         usage = getattr(response, "usage", None)
         if usage is not None:
             cumulative_input += int(getattr(usage, "prompt_tokens", 0) or 0)
             total_output += int(getattr(usage, "completion_tokens", 0) or 0)
         total_cost += _response_cost(response)
+        final_text = response.choices[0].message.content or final_text
 
-        msg = response.choices[0].message
-
-        # Build the assistant message dict to append to history.
-        assistant_dict: dict[str, Any] = {"role": "assistant"}
-        if msg.content is not None:
-            assistant_dict["content"] = msg.content
-        if getattr(msg, "tool_calls", None):
-            assistant_dict["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in msg.tool_calls
-            ]
-        messages.append(assistant_dict)
-
-        # ── Done if no tool calls ─────────────────────────────────────
-        if not getattr(msg, "tool_calls", None):
-            final_text = msg.content or ""
-            return AgentResult(
-                answer=final_text,
-                task_id=task_id,
-                turns=turn + 1,
-                input_tokens=cumulative_input,
-                output_tokens=total_output,
-                cost_usd=total_cost,
-                compactions=compactions,
-                hit_round_cap=False,
-            )
-
-        # ── Dispatch each tool call, persist tool_call row, append result ─
-        for tc in msg.tool_calls:
-            name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-
-            t0 = time.time()
-            tool_result = await tools.dispatch(name, args)
-            latency_ms = int((time.time() - t0) * 1000)
-
-            try:
-                await db.writer().execute(
-                    """
-                    INSERT INTO traces
-                        (task_id, turn_index, kind, model,
-                         tool_name, tool_input, tool_output, latency_ms, error)
-                    VALUES ($1, $2, 'tool_call', $3, $4,
-                            $5::jsonb, $6::jsonb, $7, $8)
-                    """,
-                    UUID(task_id),
-                    turn,
-                    model,
-                    name,
-                    json.dumps(args, default=str),
-                    json.dumps(tool_result, default=str)[:1_000_000],  # safety cap
-                    latency_ms,
-                    tool_result.get("error") if isinstance(tool_result, dict) else None,
-                )
-            except Exception as exc:
-                # Never fail the agent loop on a trace write.
-                logger.warning("tool_call trace write failed: %s", exc)
-
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": name,
-                    "content": tools.tool_result_text(tool_result),
-                }
-            )
-
-    # Round budget exhausted with tool results still pending — the model
-    # never got a turn to consume the last one. One tool-free call lets it
-    # synthesize a final answer from the conversation history it already
-    # has. ``tools`` is omitted entirely so the response can only be text.
-    response = await litellm.acompletion(
-        model=model,
-        messages=messages,
-        metadata={"task_id": task_id, "turn_index": max_rounds_with_tool_calls},
-    )
-    usage = getattr(response, "usage", None)
-    if usage is not None:
-        cumulative_input += int(getattr(usage, "prompt_tokens", 0) or 0)
-        total_output += int(getattr(usage, "completion_tokens", 0) or 0)
-    total_cost += _response_cost(response)
-    final_text = response.choices[0].message.content or final_text
-
-    return AgentResult(
-        answer=final_text or "(no answer produced)",
-        task_id=task_id,
-        turns=max_rounds_with_tool_calls,
-        input_tokens=cumulative_input,
-        output_tokens=total_output,
-        cost_usd=total_cost,
-        compactions=compactions,
-        hit_round_cap=True,
-    )
+        return AgentResult(
+            answer=final_text or "(no answer produced)",
+            task_id=task_id,
+            turns=max_rounds_with_tool_calls,
+            input_tokens=cumulative_input,
+            output_tokens=total_output,
+            cost_usd=total_cost,
+            compactions=compactions,
+            hit_round_cap=True,
+        )
+    finally:
+        # Per-run lifecycle: drop all loaded datasets when the run ends.
+        logger.info("task=%s done — clearing %d dataset(s)", task_id, registry.count)
+        registry.clear()
