@@ -66,7 +66,11 @@ services:
         condition: service_healthy
 
   ingest:
-    build: ./ingest
+    build:
+      # Root context so the Dockerfile can COPY the shared pyproject.toml +
+      # uv.lock (the single dependency source of truth).
+      context: .
+      dockerfile: ingest/Dockerfile
     container_name: anthelion_ingest
     environment:
       POSTGRES_HOST:     postgres   # bypass pgbouncer; COPY uses prepared writes
@@ -85,7 +89,8 @@ services:
 
   agent:
     build:
-      # Root context so the Dockerfile can COPY the shared requirements.txt.
+      # Root context so the Dockerfile can COPY the shared pyproject.toml +
+      # uv.lock (the single dependency source of truth).
       context: .
       dockerfile: service/Dockerfile
     container_name: anthelion_agent

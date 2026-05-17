@@ -75,13 +75,11 @@ def ingest_abc_headlines(conn: psycopg.Connection) -> int:
                         continue
                     iso = f"{date_int[0:4]}-{date_int[4:6]}-{date_int[6:8]}"
                     cp.write_row((iso, headline))
-        cur.execute(
-            """
+        cur.execute("""
             INSERT INTO abc_headlines (publish_date, headline)
             SELECT publish_date, headline FROM _stage_abc
             ON CONFLICT (publish_date, headline) DO NOTHING
-            """
-        )
+            """)
         inserted = cur.rowcount
     conn.commit()
     return inserted
@@ -151,14 +149,12 @@ def _ingest_us_headlines(
         if already and not FORCE_REINGEST:
             return 0
 
-        cur.execute(
-            f"""
+        cur.execute(f"""
             CREATE TEMP TABLE {stage_name} (
                 source TEXT, published_at TIMESTAMPTZ, headline TEXT,
                 ticker TEXT, publisher TEXT
             ) ON COMMIT DROP
-            """
-        )
+            """)
         with open(path, "r", encoding="utf-8", newline="") as fh:
             reader = csv.reader(fh)
             next(reader, None)  # header
@@ -252,27 +248,23 @@ def ingest_prices(conn: psycopg.Connection) -> int:
         # float-formatted ints ("2163600.0", a pandas roundtrip artifact in
         # the upstream dataset). NUMERIC accepts that on COPY; we cast to
         # BIGINT in the INSERT below.
-        cur.execute(
-            """
+        cur.execute("""
             CREATE TEMP TABLE _stage_prices (
                 date DATE, ticker TEXT, open NUMERIC, close NUMERIC,
                 low NUMERIC, high NUMERIC, volume NUMERIC
             ) ON COMMIT DROP
-            """
-        )
+            """)
         with open(DATA_DIR / "prices-split-adjusted.csv", "rb") as fh:
             with cur.copy("COPY _stage_prices FROM STDIN WITH (FORMAT CSV, HEADER true)") as cp:
                 while chunk := fh.read(1 << 16):
                     cp.write(chunk)
-        cur.execute(
-            """
+        cur.execute("""
             INSERT INTO prices (ticker, date, open, close, low, high, volume)
             SELECT ticker, date, open, close, low, high, volume::bigint
             FROM _stage_prices
             WHERE volume IS NOT NULL
             ON CONFLICT (ticker, date) DO NOTHING
-            """
-        )
+            """)
         inserted = cur.rowcount
     conn.commit()
     return inserted
