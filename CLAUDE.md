@@ -34,7 +34,7 @@ Evaluation criterion: identifying what a production-grade agent platform actuall
 anthelion_take_home/
 ├── docker-compose.yml         # postgres + pgbouncer + ingest (one-shot) + agent (FastAPI)
 ├── .env.example               # template; copy to .env and fill ANTHROPIC_API_KEY
-├── requirements.txt           # shared service-container deps
+├── pyproject.toml + uv.lock    # single dependency source (host + both images)
 ├── db/
 │   ├── 01-schema.sql          # tables, GIN tsvector indexes, traces table
 │   └── 02-setup-roles.sh      # read-only role for the sql() escape-hatch tool
@@ -54,16 +54,20 @@ Run with `docker compose up --build`; query with `python agent.py "..."`.
 
 ## Dev workflow (host-side)
 
-`uv` manages the local Python env; `pyproject.toml` is the source of truth for host-side dev. `requirements.txt` is the parallel source for Docker container builds — the two share the same runtime dep set, kept in sync by hand (small enough that drift is easy to spot).
+`uv` manages every Python environment. `pyproject.toml` + `uv.lock` are the single dependency source of truth — host dev and both container builds resolve from the same lockfile, each syncing a subset:
+
+- **host dev** — `uv sync` (project deps + the `dev` group)
+- **service image** — `uv sync --frozen --no-dev` (project deps only)
+- **ingest image** — `uv sync --frozen --only-group ingest` (just psycopg + pandas)
 
 ```bash
-uv sync --extra dev              # create .venv with runtime + dev deps
+uv sync                          # create .venv with runtime + dev deps
 uv run black .                   # auto-format
 uv run flake8                    # lint
 uv run mypy service ingest agent.py   # type-check
 ```
 
-`flake8` reads its config from `.flake8` (portable across installs without `Flake8-pyproject`). Long-line rule is suppressed per-file for `service/prompts.py` and `service/tools.py` — both contain LLM-facing string content where line-length is a meaningless metric.
+`flake8` reads its config from `.flake8` — flake8 has no native `pyproject.toml` support, and a dedicated file is portable without a plugin. Long-line rule is suppressed per-file for `service/prompts.py` and `service/tools.py` — both contain LLM-facing string content where line-length is a meaningless metric.
 
 **In-scope datasets:**
 - `abcnews-date-text.csv` — ~1.24M Australian ABC News headlines, 2003+

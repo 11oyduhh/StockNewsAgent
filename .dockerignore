@@ -1,0 +1,21 @@
+# Both image builds use the repo root as their build context. Without this
+# file the ~650 MB of CSVs and the local .venv would be shipped to the Docker
+# daemon on every build. Keep the context to just what the Dockerfiles COPY:
+# pyproject.toml, uv.lock, service/, ingest/ingest.py.
+
+# Data — mounted into the ingest container at runtime, never built in.
+*.csv
+
+# Local Python environment + caches.
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+
+# VCS, tooling, secrets, docs — none of it belongs in an image.
+.git/
+.gitignore
+.claude/
+.env
+*.md
