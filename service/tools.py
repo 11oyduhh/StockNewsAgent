@@ -3,7 +3,7 @@
 Two kinds of tools:
 
 * **Inline tools** return small results directly (``headline_search``,
-  ``headline_topic_frequency``, ``lookup_security``).
+  ``headline_topic_frequency``, ``lookup_security``, ``lookup_fundamentals``).
 * **Loaders** (``load_prices``) pull a potentially
   large result set into a server-side pandas DataFrame held in the run's
   :class:`~service.datasets.DatasetRegistry`, and return only a *handle* +
@@ -273,6 +273,81 @@ async def lookup_security(name_or_ticker: str) -> dict:
     if not rows:
         return {"rows": [], "note": f"no securities matched {name_or_ticker!r}"}
     return {"rows": _json_safe(rows), "count": len(rows)}
+
+
+# ── Inline tool 4: lookup_fundamentals ─────────────────────────────────
+
+# CSV artifacts, not real metrics — hidden from the discovery list.
+_FUNDAMENTALS_JUNK_KEYS = {"Unnamed: 0", "For Year"}
+
+
+async def lookup_fundamentals(
+    ticker: str, year: int | None = None, metric: str | None = None
+) -> dict:
+    """Annual fundamentals for a ticker from the ``fundamentals`` table.
+
+    Without ``metric``: returns the available periods plus the list of metric
+    names. With ``metric`` (case-insensitive substring): returns that metric's
+    value for each period. ``year`` filters to a single fiscal year.
+    """
+    pool = db.pool()
+    if year is not None:
+        rows = await pool.fetch(
+            "SELECT for_year, period_end::text AS period_end, data FROM fundamentals "
+            "WHERE ticker = upper($1) AND for_year = $2 ORDER BY period_end",
+            ticker,
+            year,
+        )
+    else:
+        rows = await pool.fetch(
+            "SELECT for_year, period_end::text AS period_end, data FROM fundamentals "
+            "WHERE ticker = upper($1) ORDER BY period_end",
+            ticker,
+        )
+    if not rows:
+        where = ticker.upper() + (f", fiscal year {year}" if year is not None else "")
+        return {
+            "rows": [],
+            "note": f"no fundamentals for {where} "
+            "(fundamentals cover ~2012-2016 for S&P 500 tickers)",
+        }
+
+    # data is JSONB — asyncpg hands it back as a string.
+    periods: list[dict] = []
+    parsed: list[tuple] = []
+    for r in rows:
+        data = r["data"]
+        if isinstance(data, str):
+            data = json.loads(data)
+        parsed.append((r["for_year"], r["period_end"], data))
+        periods.append({"for_year": r["for_year"], "period_end": r["period_end"]})
+
+    metric_names = sorted(k for k in parsed[0][2] if k not in _FUNDAMENTALS_JUNK_KEYS)
+
+    if metric is None:
+        return {
+            "ticker": ticker.upper(),
+            "periods": periods,
+            "available_metrics": metric_names,
+            "hint": "call again with metric=<substring> to get values, "
+            "e.g. metric='Total Revenue'",
+        }
+
+    needle = metric.strip().lower()
+    matched = [m for m in metric_names if needle in m.lower()]
+    if not matched:
+        return {
+            "ticker": ticker.upper(),
+            "error": f"no metric matching {metric!r}",
+            "available_metrics": metric_names,
+        }
+    out_rows = []
+    for for_year, period_end, data in parsed:
+        row: dict = {"for_year": for_year, "period_end": period_end}
+        for m in matched:
+            row[m] = data.get(m)
+        out_rows.append(row)
+    return {"ticker": ticker.upper(), "metrics": matched, "rows": out_rows}
 
 
 # ── Loader 1: load_prices ──────────────────────────────────────────────
@@ -599,6 +674,31 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "lookup_fundamentals",
+            "description": (
+                "Annual fundamentals for an S&P 500 ticker (revenue, net income, EPS, "
+                "margins, balance-sheet items, etc.; ~2012-2016). Call with just `ticker` "
+                "to see the available periods and metric names; add `metric` "
+                "(case-insensitive substring, e.g. 'revenue', 'net income') to get values, "
+                "and `year` to filter to one fiscal year."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticker": {"type": "string"},
+                    "year": {"type": "integer", "description": "Fiscal year, e.g. 2014."},
+                    "metric": {
+                        "type": "string",
+                        "description": "Metric-name substring, e.g. 'Total Revenue'.",
+                    },
+                },
+                "required": ["ticker"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "load_prices",
             "description": (
                 "Load a ticker's daily OHLCV + derived `daily_return` into a dataset. "
@@ -723,6 +823,7 @@ _DISPATCH: dict[str, _ToolFn] = {
     "headline_search": headline_search,
     "headline_topic_frequency": headline_topic_frequency,
     "lookup_security": lookup_security,
+    "lookup_fundamentals": lookup_fundamentals,
     "load_prices": load_prices,
     "dataset_describe": dataset_describe,
     "dataset_sample": dataset_sample,

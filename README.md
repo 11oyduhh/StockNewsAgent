@@ -43,12 +43,38 @@ The agent works through a fixed, deliberate set of tools:
 - **Prices** — load a ticker's daily OHLCV + returns, then run summary
   statistics, sampling, rolling statistics, Pearson correlation, or an ARIMA
   baseline forecast.
-- **Securities** — look up S&P 500 companies by name or symbol.
+- **Securities & fundamentals** — look up S&P 500 companies by name or symbol,
+  and pull a ticker's annual fundamentals (revenue, net income, EPS, margins,
+  balance-sheet items; ~2012–2016).
 
 Heavy data is loaded server-side and the agent operates on a *handle*, so large
 results never overflow the model's context. Requests outside the tool set
 (train an LSTM, run arbitrary SQL) are declined rather than faked — see
 [`DECISIONS.md`](DECISIONS.md).
+
+## Sample run
+
+`python agent.py "What was AAPL's total revenue in 2014?" --trace` — `--trace`
+streams the run live, each step printed as it completes:
+
+```
+── live trace ──
+  turn 0  llm_call   anthropic/claude-sonnet-4-6     3.2k/128    $0.0114    2678ms
+             thinking ─
+             │ The user wants to know Apple's total revenue in 2014. Let me
+             │ look up the fundamentals for AAPL.
+             → requests: lookup_fundamentals
+  turn 0  tool_call  lookup_fundamentals                                     11ms
+  turn 1  llm_call   anthropic/claude-sonnet-4-6     3.4k/104    $0.0117    2719ms
+             thinking ─
+             │ Apple's total revenue in fiscal year 2014 was $182,795,000,000
+             │ (~$182.8 billion). The fiscal year ended September 27, 2014.
+
+Apple's (AAPL) total revenue for fiscal year 2014 was $182,795,000,000
+(~$182.8 billion), for the period ending September 27, 2014.
+
+[task_id=f8c27d1b-…  turns=2  tokens=6552/232  cost=$0.0231]
+```
 
 ## How it works
 

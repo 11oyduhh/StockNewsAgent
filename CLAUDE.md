@@ -42,7 +42,7 @@ anthelion_take_home/
 ├── service/                   # FastAPI agent service
 │   ├── main.py                # FastAPI app — /run, /run/stream, /healthz, /traces/{id}
 │   ├── loop.py                # agent loop (LiteLLM tool-use + compaction)
-│   ├── tools.py               # 9-tool registry + dispatcher
+│   ├── tools.py               # 10-tool registry + dispatcher
 │   ├── compaction.py          # deterministic conversation compaction
 │   ├── telemetry.py           # LiteLLM CustomLogger → traces rows
 │   ├── db.py                  # asyncpg connection pool (via pgbouncer)

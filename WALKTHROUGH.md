@@ -111,6 +111,7 @@ three kinds.
 | `headline_search` | Full-text search across the headline corpora; returns matching headline text (≤50 rows) |
 | `headline_topic_frequency` | Counts of matching headlines bucketed by day/week/month/year |
 | `lookup_security` | Find a ticker by company name or symbol |
+| `lookup_fundamentals` | Annual fundamentals for a ticker — revenue, income, EPS, margins, balance-sheet items |
 
 The **loader** pulls a potentially large result set into a server-side pandas
 DataFrame and returns only a *handle* (`ds_1`) + the dataset's shape,

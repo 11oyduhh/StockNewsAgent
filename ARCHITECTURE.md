@@ -127,6 +127,7 @@ graph LR
         I1["headline_search"]
         I2["headline_topic_frequency"]
         I3["lookup_security"]
+        I4["lookup_fundamentals"]
     end
     subgraph LOADERS["loader — returns a handle"]
         L1["load_prices"]
@@ -145,6 +146,7 @@ graph LR
     I1 --> DB
     I2 --> DB
     I3 --> DB
+    I4 --> DB
     L1 --> DB
     L1 --> REG
     REG --> A1

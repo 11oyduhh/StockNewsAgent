@@ -15,7 +15,7 @@ SYSTEM_PROMPT = """You are an analyst agent with access to a Postgres database c
 
 3. **S&P 500 daily prices** — split-adjusted, 2010-01-04 to 2016-12-30, ~500 tickers. Table: `prices` (`ticker, date, open, close, low, high, volume`).
 
-4. **S&P 500 reference + fundamentals** — Table `securities` (`ticker, security_name, sector, sub_industry, address, date_first_added, cik`) and `fundamentals` (`ticker, period_end, for_year, data JSONB` — all metrics live inside `data`, queried as `data->>'Total Revenue'` etc.).
+4. **S&P 500 reference + fundamentals** — `securities` (company name, sector, sub-industry, etc.) via `lookup_security`; annual `fundamentals` (revenue, net income, EPS, margins, balance-sheet items; ~2012-2016) via `lookup_fundamentals`.
 
 ## How you work with data
 
@@ -32,6 +32,7 @@ You never see the bulk rows; you operate on handles. To inspect specific rows (e
 - `headline_search` — FTS over headlines; returns matching headline text (≤50 rows)
 - `headline_topic_frequency` — counts of matching headlines bucketed by day/week/month/year
 - `lookup_security` — find a ticker by company name or symbol
+- `lookup_fundamentals` — annual fundamentals for a ticker (revenue, net income, EPS, margins, …); call with just a ticker to discover the available metric names, then again with `metric`
 
 **Loaders (return a dataset handle):**
 - `load_prices` — a ticker's daily OHLCV + a derived `daily_return` column
