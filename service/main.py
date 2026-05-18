@@ -2,6 +2,9 @@
 
 * ``POST /run`` — execute one task end-to-end; returns the answer + a
   small summary (turns, tokens, cost, whether the round cap fired).
+* ``POST /run/stream`` — same, but streams telemetry live as
+  newline-delimited JSON (one event per LLM/tool step); aborts the run
+  if the client disconnects.
 * ``GET /healthz`` — liveness probe used by the compose healthcheck.
 * ``GET /traces/{task_id}`` — replay one task's telemetry (every LLM
   call and tool call, in order, with the model's reasoning).
@@ -12,14 +15,16 @@ every LLM call writes a ``traces`` row, and warms the asyncpg pool.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
-from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 from uuid import UUID
 
 import litellm
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import db, loop
@@ -32,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-@asynccontextmanager
+@contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_pool()
     litellm.callbacks = [PostgresTraceLogger()]
@@ -81,6 +86,58 @@ async def run(req: RunRequest) -> RunResponse:
         logger.exception("agent loop failed")
         raise HTTPException(status_code=500, detail=f"agent loop failed: {exc}") from exc
     return RunResponse(**result.__dict__)
+
+
+@app.post("/run/stream")
+async def run_stream(req: RunRequest, request: Request) -> StreamingResponse:
+    """Execute a task and stream telemetry live as newline-delimited JSON.
+
+    One event per line — `llm_call` / `tool_call` as each step completes,
+    then a terminal `result` (or `error`). If the client disconnects
+    mid-run, the server cancels the agent loop.
+    """
+    task = (req.task or "").strip()
+    if not task:
+        raise HTTPException(status_code=400, detail="task must be non-empty")
+
+    async def events() -> AsyncIterator[str]:
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def on_event(ev: dict) -> None:
+            await queue.put(ev)
+
+        run_task = asyncio.create_task(
+            loop.run_agent(
+                task,
+                max_rounds_with_tool_calls=req.max_rounds_with_tool_calls,
+                on_event=on_event,
+            )
+        )
+        try:
+            while not (run_task.done() and queue.empty()):
+                if await request.is_disconnected():
+                    run_task.cancel()  # client gone — abort the run
+                    return
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+                yield json.dumps(ev) + "\n"
+            if run_task.cancelled():
+                return
+            exc = run_task.exception()
+            if exc is not None:
+                logger.error("agent loop failed: %s", exc)
+                yield json.dumps({"type": "error", "detail": str(exc)}) + "\n"
+            else:
+                yield json.dumps({"type": "result", **run_task.result().__dict__}) + "\n"
+        finally:
+            if not run_task.done():
+                run_task.cancel()
+            with contextlib.suppress(BaseException):
+                await run_task
+
+    return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
 # ── Telemetry surface ──────────────────────────────────────────────────

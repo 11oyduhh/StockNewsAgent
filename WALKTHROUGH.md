@@ -44,14 +44,15 @@ Everything runs in containers defined by `docker-compose.yml`:
    successfully before it starts.
 
 4. **agent** — the FastAPI service that *is* the agent. It exposes
-   `POST /run` (execute a task), `GET /healthz` (liveness), and
-   `GET /traces/{task_id}` (replay a run's telemetry). This is where
-   the LLM loop, the tools, compaction, and telemetry live.
+   `POST /run` (execute a task), `POST /run/stream` (execute + stream
+   telemetry live), `GET /healthz` (liveness), and `GET /traces/{task_id}`
+   (replay a past run's telemetry). This is where the LLM loop, the
+   tools, compaction, and telemetry live.
 
 A host-side script, `agent.py`, is the client. It has no third-party
 dependencies — it just POSTs your task to the service and prints the
 answer plus a short run summary (turns, tokens, cost). With `--trace`
-it also prints the run's step-by-step telemetry timeline; `--trace-only
+it streams the run live — each step prints as it completes; `--trace-only
 <task_id>` inspects a past run.
 
 ## Ingestion
@@ -178,12 +179,15 @@ failure, and writes a row. Tool calls are recorded by the agent loop
 directly. The telemetry write is wrapped defensively — a logging
 failure can never break the actual agent run.
 
-Collected telemetry you can't read is just theatre, so `GET
-/traces/{task_id}` exposes it: it replays a task as an ordered timeline
-of every LLM call and tool call, with token/cost/latency per step
-(`?verbose=true` adds the full prompts, responses, and tool I/O).
-`python agent.py "…" --trace` prints that timeline right after a run;
-`--trace-only <task_id>` inspects a past one.
+Collected telemetry you can't read is just theatre, so two endpoints
+expose it. `GET /traces/{task_id}` replays a *past* task as an ordered
+timeline of every LLM call and tool call, with token/cost/latency per
+step (`?verbose=true` adds the full prompts, responses, and tool I/O).
+`POST /run/stream` does it *live* — it runs the task and streams one
+JSON event per step as each completes, so you watch the agent work in
+real time; if the client disconnects mid-run, the server aborts the
+loop. `python agent.py "…" --trace` uses the streaming endpoint;
+`--trace-only <task_id>` uses the replay one.
 
 The agent also runs with **extended thinking** enabled, so each LLM
 call carries the model's reasoning. That reasoning is captured into
@@ -197,7 +201,7 @@ after the fact, and cost/latency/error rates sliced by model or tool.
 docker-compose.yml      the four services, wired together
 db/01-schema.sql        tables, GIN full-text indexes, traces table
 ingest/ingest.py        streamed CSV → Postgres
-service/main.py         FastAPI app — POST /run, GET /healthz, GET /traces/{id}
+service/main.py         FastAPI app — /run, /run/stream, /healthz, /traces/{id}
 service/loop.py         the agent loop (the heart of it)
 service/tools.py        the tool registry + dispatcher
 service/datasets.py     the per-run dataset registry (handles)

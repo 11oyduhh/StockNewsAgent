@@ -40,7 +40,7 @@ anthelion_take_home/
 │   └── 01-schema.sql          # tables, GIN tsvector indexes, traces table
 ├── ingest/                    # one-shot: streamed CSV → Postgres via psycopg.copy()
 ├── service/                   # FastAPI agent service
-│   ├── main.py                # FastAPI lifespan + POST /run + GET /healthz + GET /traces/{id}
+│   ├── main.py                # FastAPI app — /run, /run/stream, /healthz, /traces/{id}
 │   ├── loop.py                # agent loop (LiteLLM tool-use + compaction)
 │   ├── tools.py               # 9-tool registry + dispatcher
 │   ├── compaction.py          # deterministic conversation compaction
