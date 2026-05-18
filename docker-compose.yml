@@ -11,6 +11,7 @@
 #       ▲
 #       └──── agent (FastAPI :8000)
 #   ingest (one-shot, populates postgres on first run; idempotent on re-runs)
+#   demo   (one-shot, runs a sample task through agent.py once the agent is up)
 #
 # All non-secret vars default to sensible dev values so a bare .env
 # containing only ANTHROPIC_API_KEY brings the stack up cleanly.
@@ -36,9 +37,9 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
-    # Statement timeout is enforced per-connection on the read-only pool
-    # (see service/db.py). A server-wide timeout would kill long ingest COPY
-    # operations, so we deliberately don't set one here.
+    # No server-wide statement_timeout: it would kill the long ingest COPY
+    # operations. Agent tool queries are bounded by the per-tool-call timeout
+    # in the loop instead (see service/loop.py).
 
   pgbouncer:
     # edoburu/pgbouncer is the community-maintained pgbouncer image.
@@ -120,6 +121,27 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  demo:
+    # One-shot: once the agent is healthy, run agent.py against it with a
+    # sample task and stream the run live (--trace), then exit. Makes
+    # `docker compose up` a single command that stands the stack up AND
+    # exercises it end-to-end with the telemetry visible. Override the task
+    # with AGENT_DEMO_TASK; `docker compose up agent` brings the stack up
+    # without it.
+    image: python:3.11-slim
+    container_name: anthelion_demo
+    environment:
+      ANTHELION_URL: http://agent:8000
+      AGENT_DEMO_TASK: "${AGENT_DEMO_TASK:-Who showed the most revenue growth in 2016 between Microsoft (MSFT), Apple (AAPL), and Salesforce (CRM)?}"
+    volumes:
+      # agent.py is stdlib-only, so plain python:3.11-slim runs it as-is.
+      - ./agent.py:/agent.py:ro
+    command: ["sh", "-c", "python /agent.py \"$$AGENT_DEMO_TASK\" --trace"]
+    depends_on:
+      agent:
+        condition: service_healthy
+    restart: "no"   # one-shot; runs the sample task once and exits
 
 volumes:
   anthelion_pgdata:
