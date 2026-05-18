@@ -16,12 +16,14 @@ traced. The whole stack comes up with one `docker compose` command.
 
 ```bash
 cp .env.example .env          # then set ANTHROPIC_API_KEY
-docker compose up --build     # postgres + pgbouncer + ingest + agent
+docker compose up --build     # postgres + pgbouncer + ingest + agent + demo
 ```
 
 The first run ingests ~680 MB of CSV data into Postgres (a few minutes); later
 runs detect the data is already loaded and skip, so startup is fast. Once the
-`agent` service is healthy:
+agent is healthy, the one-shot `demo` service runs a sample task end-to-end —
+you'll see the traced run in the logs — so `docker compose up` alone both
+stands up *and* exercises the platform. Then, for your own tasks:
 
 ```bash
 python agent.py "How volatile was AAPL in 2013, and what were its 3 worst days?"
@@ -78,7 +80,7 @@ Apple's (AAPL) total revenue for fiscal year 2014 was $182,795,000,000
 
 ## How it works
 
-`docker compose up` starts four services:
+`docker compose up` starts five services:
 
 | Service | Role |
 |---|---|
@@ -86,6 +88,7 @@ Apple's (AAPL) total revenue for fiscal year 2014 was $182,795,000,000
 | `pgbouncer` | connection pooler in front of Postgres |
 | `ingest` | one-shot job — streams the CSVs into Postgres, then exits (idempotent) |
 | `agent` | FastAPI service — the agent loop, tools, compaction, telemetry |
+| `demo` | one-shot job — runs a sample task through `agent.py --trace` once the agent is up, then exits |
 
 `agent.py` is a thin host-side client that POSTs tasks to the `agent` service
 over HTTP. Full detail in the docs below.

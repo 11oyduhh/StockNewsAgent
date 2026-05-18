@@ -14,11 +14,12 @@ What runs where, and how the pieces connect, after `docker compose up`.
 graph TB
     subgraph HOST["host machine"]
         CLI["agent.py<br/>CLI client (stdlib only)"]
-        CSV[("6 CSV files<br/>~650 MB")]
+        CSV[("6 CSV files<br/>~680 MB")]
     end
 
     subgraph STACK["docker compose — project: anthelion_take_home"]
         INGEST["ingest<br/>one-shot, idempotent"]
+        DEMO["demo<br/>one-shot sample run"]
         AGENT["agent<br/>FastAPI + uvicorn :8000"]
         PGB["pgbouncer :6432<br/>transaction pooling"]
         PG[("postgres 16<br/>tables + GIN FTS + traces")]
@@ -27,12 +28,16 @@ graph TB
     CLI -->|"POST /run {task}"| AGENT
     CSV -.->|"streamed COPY"| INGEST
     INGEST -->|"bulk load"| PG
+    DEMO -->|"agent.py --trace, on startup"| AGENT
     AGENT -->|"connection pool"| PGB
     PGB --> PG
 ```
 
 - **ingest** runs once, populates Postgres, exits. The agent service
   waits for it via `depends_on: service_completed_successfully`.
+- **demo** runs once after the agent is healthy — `agent.py` against the
+  agent with a sample task — so `docker compose up` alone proves the
+  stack end-to-end.
 - All agent traffic goes through **pgbouncer** via a single asyncpg pool
   (the hot path — production shape). ingest connects to Postgres directly,
   bypassing pgbouncer, because bulk `COPY` wants a stable direct connection.

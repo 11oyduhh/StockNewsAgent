@@ -15,16 +15,19 @@ to end by a single CLI script.
 ## One-command bring-up
 
 ```bash
-docker compose up --build      # starts the stack
-python agent.py "your task"    # asks the agent a question
+docker compose up --build      # starts the stack + runs one sample task
+python agent.py "your task"    # ask your own questions
 ```
 
-`docker compose up` builds and starts four services. On first run it
-also ingests ~650 MB of CSV data into Postgres (a few minutes); on
+`docker compose up` builds and starts five services. On first run it
+also ingests ~680 MB of CSV data into Postgres (a few minutes); on
 later runs ingestion detects the data is already there and skips, so
-startup is fast.
+startup is fast. Once the agent is healthy the one-shot `demo` service
+runs a sample task end-to-end with `--trace` — so the single command
+both *stands up* the platform and *exercises* it, telemetry streamed to
+the logs.
 
-## The four services
+## The five services
 
 Everything runs in containers defined by `docker-compose.yml`:
 
@@ -48,6 +51,13 @@ Everything runs in containers defined by `docker-compose.yml`:
    telemetry live), `GET /healthz` (liveness), and `GET /traces/{task_id}`
    (replay a past run's telemetry). This is where the LLM loop, the
    tools, compaction, and telemetry live.
+
+5. **demo** — a one-shot job. Once the agent is healthy it runs
+   `agent.py` against it with a sample task (`--trace`, so the run
+   streams to the logs), then exits. It's what makes `docker compose up`
+   a genuinely single command — the stack comes up *and* answers a real
+   question. `docker compose up agent` brings the stack up without it;
+   `AGENT_DEMO_TASK` overrides the question.
 
 A host-side script, `agent.py`, is the client. It has no third-party
 dependencies — it just POSTs your task to the service and prints the
