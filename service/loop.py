@@ -66,25 +66,21 @@ def _config_from_env() -> compaction.CompactionConfig:
     )
 
 
-def _thinking_kwargs() -> dict[str, Any]:
-    """LiteLLM kwargs for Anthropic extended thinking — or ``{}`` when disabled.
+# Anthropic extended thinking — always on. It surfaces the model's reasoning,
+# which the telemetry callback captures into traces and GET /traces/{task_id}
+# exposes, so a run is auditable for *why* the agent chose each tool. Not an
+# operational knob: it's a core observability decision for this platform.
+#
+# The interleaved-thinking beta makes the model reason before every tool call,
+# not just the first turn. Anthropic requires max_tokens > budget_tokens; the
+# +6144 leaves headroom for the answer itself.
+_THINKING_BUDGET_TOKENS = 10_000
 
-    Extended thinking surfaces the model's reasoning, which the telemetry
-    callback captures into ``traces.response`` and ``GET /traces/{task_id}``
-    exposes. Anthropic requires ``max_tokens > budget_tokens``, so we add
-    headroom for the answer itself.
-    """
-    if os.environ.get("AGENT_EXTENDED_THINKING", "1").lower() not in ("1", "true", "yes"):
-        return {}
-    budget = int(os.environ.get("AGENT_THINKING_BUDGET_TOKENS", "2048"))
-    return {
-        "thinking": {"type": "enabled", "budget_tokens": budget},
-        "max_tokens": budget + 6144,
-        # Interleaved thinking: without this beta the model only thinks on the
-        # first turn; with it, it reasons before each tool call too — so the
-        # trace shows the agent's reasoning at every decision point.
-        "extra_headers": {"anthropic-beta": "interleaved-thinking-2025-05-14"},
-    }
+THINKING_KWARGS: dict[str, Any] = {
+    "thinking": {"type": "enabled", "budget_tokens": _THINKING_BUDGET_TOKENS},
+    "max_tokens": _THINKING_BUDGET_TOKENS + 6144,
+    "extra_headers": {"anthropic-beta": "interleaved-thinking-2025-05-14"},
+}
 
 
 def _response_cost(response: Any) -> float:
@@ -111,7 +107,6 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
     # Guard the degenerate 0 / negative case — the env var is unvalidated.
     max_rounds_with_tool_calls = max(1, max_rounds_with_tool_calls)
     cfg = _config_from_env()
-    thinking_kwargs = _thinking_kwargs()
 
     # Per-run dataset store — heavy tools load into it, analysis tools read it,
     # and it is cleared in the finally below so memory is bounded to the run.
@@ -152,7 +147,7 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
                 tools=tools.TOOL_DEFINITIONS,
                 tool_choice="auto",
                 metadata={"task_id": task_id, "turn_index": turn},
-                **thinking_kwargs,
+                **THINKING_KWARGS,
             )
 
             usage = getattr(response, "usage", None)
@@ -252,7 +247,7 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
             model=model,
             messages=messages,
             metadata={"task_id": task_id, "turn_index": max_rounds_with_tool_calls},
-            **thinking_kwargs,
+            **THINKING_KWARGS,
         )
         usage = getattr(response, "usage", None)
         if usage is not None:

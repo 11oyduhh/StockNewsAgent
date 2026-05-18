@@ -211,6 +211,37 @@ def _has_orphan_tool_results(messages: List[Message]) -> bool:
     return not (all_results <= all_uses)
 
 
+def _has_thinking(msg: Message) -> bool:
+    """True iff the message carries reasoning in either the LiteLLM
+    (``thinking_blocks`` field) or Anthropic-native (``thinking`` content
+    block) shape."""
+    if msg.get("thinking_blocks"):
+        return True
+    content = msg.get("content")
+    if isinstance(content, list):
+        return any(isinstance(b, dict) and b.get("type") == "thinking" for b in content)
+    return False
+
+
+def _tool_use_missing_thinking(messages: List[Message]) -> bool:
+    """Defensive: True iff a preserved assistant message makes tool calls but
+    carries no thinking block.
+
+    With extended thinking, Anthropic requires the thinking block from a
+    tool-calling turn to accompany it whenever that turn's tool_result is in
+    the conversation. The preserved tail is kept verbatim — ``thinking_blocks``
+    is a field on the assistant message, so it rides along with its tool_calls
+    automatically — so this should never fire. It is the backstop if a future
+    change starts rebuilding or stripping preserved messages.
+    """
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        if _collect_tool_use_ids(msg) and not _has_thinking(msg):
+            return True
+    return False
+
+
 # ── Summary blob ───────────────────────────────────────────────────────
 
 
@@ -342,6 +373,9 @@ def compact_messages(
     cut = _walk_back_for_pair_safety(messages, raw_cut)
     walk_back_steps = max(0, raw_cut - cut)
     compacted = messages[:cut]
+    # The tail is preserved verbatim — whole message dicts, not rebuilt. That
+    # is what keeps tool_use/tool_result pairs *and* extended-thinking blocks
+    # (a field on the assistant message) intact across a compaction.
     preserved = messages[cut:]
 
     if not compacted:
@@ -367,13 +401,21 @@ def compact_messages(
     }
     new_messages: List[Message] = [summary_msg] + list(preserved)
 
-    # Post-compaction integrity backstop. The walk-back should make this
-    # unreachable; any time it fires we have a real regression to fix.
+    # Post-compaction integrity backstop. The walk-back + verbatim tail
+    # preservation should make both of these unreachable; either firing means
+    # a real regression. Anthropic rejects the conversation if a tool_result
+    # is orphaned, or — under extended thinking — if a tool-calling turn is
+    # missing its thinking block.
+    backstop_reason = None
     if _has_orphan_tool_results(new_messages):
+        backstop_reason = "walk-back left an orphan tool_result in the preserved tail"
+    elif _tool_use_missing_thinking(new_messages):
+        backstop_reason = "a preserved tool-calling turn lost its thinking block"
+    if backstop_reason:
         logger.warning(
-            "Compaction integrity backstop fired: walk-back left an orphan "
-            "tool_result in the preserved tail. Returning original messages "
-            "uncompacted to avoid API rejection."
+            "Compaction integrity backstop fired: %s. Returning original "
+            "messages uncompacted to avoid API rejection.",
+            backstop_reason,
         )
         return CompactedMessages(
             messages=list(messages),

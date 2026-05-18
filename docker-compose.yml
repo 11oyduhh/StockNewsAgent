@@ -96,9 +96,6 @@ services:
       ANTHROPIC_API_KEY:          ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY must be set in .env or environment}
       LITELLM_MODEL:              ${LITELLM_MODEL:-anthropic/claude-sonnet-4-6}
       AGENT_MAX_ROUNDS_WITH_TOOL_CALLS: ${AGENT_MAX_ROUNDS_WITH_TOOL_CALLS:-10}
-      # Extended thinking — captures the model's reasoning into traces.
-      AGENT_EXTENDED_THINKING:      ${AGENT_EXTENDED_THINKING:-1}
-      AGENT_THINKING_BUDGET_TOKENS: ${AGENT_THINKING_BUDGET_TOKENS:-2048}
       COMPACTION_TRIGGER_TOKENS:  ${COMPACTION_TRIGGER_TOKENS:-20000}
       COMPACTION_PRESERVE_RECENT: ${COMPACTION_PRESERVE_RECENT:-4}
       # The agent's connection pool goes through pgbouncer.
