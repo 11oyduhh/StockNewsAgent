@@ -31,11 +31,19 @@ dev = [
     "black>=24.10.0",
     "mypy>=1.13.0",
     "flake8>=7.1.0",  # config lives in .flake8 (portable, no plugin needed)
+    "pytest>=8.0.0",
 ]
 
 # Application, not a package — uv shouldn't try to install us as a wheel.
 [tool.uv]
 package = false
+
+
+[tool.pytest.ini_options]
+# `pythonpath = ["."]` puts the repo root on sys.path so tests can
+# `import service.*` without the project being installed as a package.
+pythonpath = ["."]
+testpaths = ["tests"]
 
 
 # ── Code-quality tooling ───────────────────────────────────────────────

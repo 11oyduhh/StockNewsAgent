@@ -92,6 +92,7 @@ uv sync                              # create .venv with runtime + dev deps
 uv run black .                       # format
 uv run flake8                        # lint
 uv run mypy service ingest agent.py  # type-check
+uv run pytest                        # unit tests (compaction)
 ```
 
 ## Docs
