@@ -45,7 +45,8 @@ services:
     # Replaces bitnami/pgbouncer (deprecated when Bitnami's image catalog
     # moved). Env-var conventions differ (DB_*, LISTEN_PORT, no PGBOUNCER_*
     # prefix); the role in the stack is unchanged.
-    image: edoburu/pgbouncer:latest
+    # Pinned to a version tag (like postgres:16) for reproducible builds.
+    image: edoburu/pgbouncer:v1.25.1-p0
     container_name: anthelion_pgbouncer
     environment:
       DB_HOST:     postgres
