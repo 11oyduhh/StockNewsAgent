@@ -98,9 +98,3 @@ The full DDL lives in [`db/01-schema.sql`](db/01-schema.sql), applied once on fi
 - **Eval harness:** task fixtures with expected outputs; regression tests on prompt or model changes; offline scoring before any model swap.
 - **Secrets:** vault-backed config (Vault / AWS Secrets Manager / Doppler); per-tenant API key scoping; automatic rotation.
 - **MCP:** when extensibility is actually needed, expose stable, vetted tools as MCP servers so other agents in the org can compose them. Adopting MCP only once we have a reuse story makes the abstraction earn its weight.
-
-## Open items
-
-- Exact compaction trigger thresholds for our (likely shorter) conversations — tune empirically.
-- Eval fixture set (golden tasks + expected behavior).
-- ~~Whether to provide a single composite tool vs. primitives.~~ Resolved: primitives — loaders + a fixed analysis menu the agent composes (load → describe → sample/rolling/correlate/arima).
