@@ -20,15 +20,16 @@ with the model's reasoning); `--trace-only <task_id>` inspects a past run.
 
 ## Data setup
 
-The six source CSVs (~2 GB) are **not** committed (they're `.gitignore`d).
-Place them in the repo root before `docker compose up`:
+The six source CSVs (~680 MB) are **not** committed (they're `.gitignore`d).
+Place them in the `datasets/` folder before `docker compose up` — the ingest
+container mounts that folder and loads everything in it:
 
-- `abcnews-date-text.csv`
-- `analyst_ratings_processed.csv`
-- `raw_partner_headlines.csv`
-- `prices-split-adjusted.csv`
-- `securities.csv`
-- `fundamentals.csv`
+- `datasets/abcnews-date-text.csv`
+- `datasets/analyst_ratings_processed.csv`
+- `datasets/raw_partner_headlines.csv`
+- `datasets/prices-split-adjusted.csv`
+- `datasets/securities.csv`
+- `datasets/fundamentals.csv`
 
 ## Docs
 

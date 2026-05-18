@@ -35,6 +35,7 @@ anthelion_take_home/
 ├── docker-compose.yml         # postgres + pgbouncer + ingest (one-shot) + agent (FastAPI)
 ├── .env.example               # template; copy to .env and fill ANTHROPIC_API_KEY
 ├── pyproject.toml + uv.lock    # single dependency source (host + both images)
+├── datasets/                   # the 6 source CSVs (gitignored; ingest mounts this)
 ├── db/
 │   └── 01-schema.sql          # tables, GIN tsvector indexes, traces table
 ├── ingest/                    # one-shot: streamed CSV → Postgres via psycopg.copy()
