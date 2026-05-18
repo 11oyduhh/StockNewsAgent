@@ -22,7 +22,7 @@ import asyncpg
 _pool: Optional[asyncpg.Pool] = None
 
 
-async def init_pools() -> None:
+async def init_pool() -> None:
     """Initialise the connection pool. Idempotent — safe to call from FastAPI startup."""
     global _pool
 
@@ -39,7 +39,7 @@ async def init_pools() -> None:
         )
 
 
-async def close_pools() -> None:
+async def close_pool() -> None:
     """Close the pool on FastAPI shutdown."""
     global _pool
     if _pool is not None:
@@ -49,5 +49,5 @@ async def close_pools() -> None:
 
 def pool() -> asyncpg.Pool:
     if _pool is None:
-        raise RuntimeError("connection pool not initialised; call init_pools() first")
+        raise RuntimeError("connection pool not initialised; call init_pool() first")
     return _pool
