@@ -66,16 +66,22 @@ over HTTP. Full detail in the docs below.
 
 ## Data setup
 
-The six source CSVs (~680 MB) are **not** committed (they're `.gitignore`d).
-Place them in the `datasets/` folder before `docker compose up` — the ingest
-container mounts that folder and loads everything in it:
+The six source CSVs (~680 MB) are **not** committed (they're `.gitignore`d —
+two of them exceed GitHub's 100 MB file limit). Download them from Kaggle and
+drop them into `datasets/` before `docker compose up`; the ingest container
+mounts that folder and loads everything in it.
 
-- `datasets/abcnews-date-text.csv`
-- `datasets/analyst_ratings_processed.csv`
-- `datasets/raw_partner_headlines.csv`
-- `datasets/prices-split-adjusted.csv`
-- `datasets/securities.csv`
-- `datasets/fundamentals.csv`
+| File(s) → place in `datasets/` | Kaggle dataset |
+|---|---|
+| `abcnews-date-text.csv` | [A Million News Headlines](https://www.kaggle.com/datasets/therohk/million-headlines) |
+| `prices-split-adjusted.csv`, `securities.csv`, `fundamentals.csv` | [New York Stock Exchange](https://www.kaggle.com/datasets/dgawlik/nyse) |
+| `analyst_ratings_processed.csv`, `raw_partner_headlines.csv` | [Massive Stock News Analysis DB for NLP Backtests](https://www.kaggle.com/datasets/miguelaenlle/massive-stock-news-analysis-db-for-nlpbacktests) |
+
+The first two are the datasets named in the assignment (news headlines + NYSE
+market data). The third — US ticker-tagged headlines — is added so the agent
+has a US news corpus overlapping the 2010–2016 price window; see
+[`DECISIONS.md`](DECISIONS.md). The NYSE dataset also ships a raw `prices.csv`;
+use `prices-split-adjusted.csv` (split-adjusted is correct for returns).
 
 ## Development
 

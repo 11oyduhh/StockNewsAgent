@@ -84,6 +84,11 @@ results back, repeat. It ends when the model replies with no tool calls
 (it has an answer); if the round budget runs out first, a final
 tool-free call (diagram 3) synthesizes the answer from the history.
 
+`POST /run` (above) returns one response when the run finishes.
+`POST /run/stream` runs the *same* loop but emits one JSON event per
+step as it happens — `agent.py --trace` consumes it to print the run
+live. If that client disconnects mid-run, the server cancels the loop.
+
 ---
 
 ## 3. Agent loop — decision flow
