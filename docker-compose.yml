@@ -5,10 +5,10 @@
 #
 # Topology:
 #   postgres (data + traces)
-#       ▲                ▲
-#       │ writer hot     │ read-only (sql() tool, direct)
-#   pgbouncer (6432)     │
-#       ▲                │
+#       ▲
+#       │ all agent traffic, pooled
+#   pgbouncer (6432)
+#       ▲
 #       └──── agent (FastAPI :8000)
 #   ingest (one-shot, populates postgres on first run; idempotent on re-runs)
 #
@@ -28,9 +28,6 @@ services:
       POSTGRES_USER:     ${POSTGRES_USER:-anthelion}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-anthelion_dev_pw}
       POSTGRES_DB:       ${POSTGRES_DB:-anthelion}
-      # Surfaced for db/02-setup-roles.sh to read.
-      POSTGRES_READONLY_USER:     ${POSTGRES_READONLY_USER:-anthelion_ro}
-      POSTGRES_READONLY_PASSWORD: ${POSTGRES_READONLY_PASSWORD:-anthelion_ro_dev_pw}
     volumes:
       - anthelion_pgdata:/var/lib/postgresql/data
       - ./db:/docker-entrypoint-initdb.d:ro
@@ -101,19 +98,12 @@ services:
       AGENT_MAX_ROUNDS_WITH_TOOL_CALLS: ${AGENT_MAX_ROUNDS_WITH_TOOL_CALLS:-10}
       COMPACTION_TRIGGER_TOKENS:  ${COMPACTION_TRIGGER_TOKENS:-20000}
       COMPACTION_PRESERVE_RECENT: ${COMPACTION_PRESERVE_RECENT:-4}
-      # Writer pool goes through pgbouncer.
+      # The agent's connection pool goes through pgbouncer.
       POSTGRES_HOST:     pgbouncer
       POSTGRES_PORT:     6432
       POSTGRES_USER:     ${POSTGRES_USER:-anthelion}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-anthelion_dev_pw}
       POSTGRES_DB:       ${POSTGRES_DB:-anthelion}
-      # Read-only pool talks to postgres directly (low volume; avoids
-      # multi-user pgbouncer config).
-      POSTGRES_READONLY_HOST:     postgres
-      POSTGRES_READONLY_PORT:     5432
-      POSTGRES_READONLY_USER:     ${POSTGRES_READONLY_USER:-anthelion_ro}
-      POSTGRES_READONLY_PASSWORD: ${POSTGRES_READONLY_PASSWORD:-anthelion_ro_dev_pw}
-      AGENT_SQL_STATEMENT_TIMEOUT_MS:   ${AGENT_SQL_STATEMENT_TIMEOUT_MS:-10000}
       AGENT_DATASET_MAX_ROWS:           ${AGENT_DATASET_MAX_ROWS:-200000}
       AGENT_DATASET_HEAD_ROWS:          ${AGENT_DATASET_HEAD_ROWS:-5}
       AGENT_DATASET_SAMPLE_MAX:         ${AGENT_DATASET_SAMPLE_MAX:-50}

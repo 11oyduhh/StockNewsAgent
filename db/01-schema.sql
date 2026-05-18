@@ -2,8 +2,6 @@
 --
 -- Loaded once by the postgres image on first boot via
 -- /docker-entrypoint-initdb.d/. Idempotent DDL only — no secrets.
--- The read-only role used by the agent's sql() tool is created
--- by 02-setup-roles.sh, which pulls its password from env.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- gen_random_uuid()
 

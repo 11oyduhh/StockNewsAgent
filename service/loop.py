@@ -185,7 +185,7 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
                 latency_ms = int((time.time() - t0) * 1000)
 
                 try:
-                    await db.writer().execute(
+                    await db.pool().execute(
                         """
                         INSERT INTO traces
                             (task_id, turn_index, kind, model,

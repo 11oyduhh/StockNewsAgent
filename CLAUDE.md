@@ -36,16 +36,15 @@ anthelion_take_home/
 ├── .env.example               # template; copy to .env and fill ANTHROPIC_API_KEY
 ├── pyproject.toml + uv.lock    # single dependency source (host + both images)
 ├── db/
-│   ├── 01-schema.sql          # tables, GIN tsvector indexes, traces table
-│   └── 02-setup-roles.sh      # read-only role for the sql() escape-hatch tool
+│   └── 01-schema.sql          # tables, GIN tsvector indexes, traces table
 ├── ingest/                    # one-shot: streamed CSV → Postgres via psycopg.copy()
 ├── service/                   # FastAPI agent service
 │   ├── main.py                # FastAPI lifespan + POST /run + GET /healthz
 │   ├── loop.py                # agent loop (LiteLLM tool-use + compaction)
-│   ├── tools.py               # 8-tool registry + dispatcher
+│   ├── tools.py               # 9-tool registry + dispatcher
 │   ├── compaction.py          # simplified port of the AgenticCRE pattern
 │   ├── telemetry.py           # LiteLLM CustomLogger → traces rows
-│   ├── db.py                  # asyncpg pools: writer (via pgbouncer) + reader (direct, RO)
+│   ├── db.py                  # asyncpg connection pool (via pgbouncer)
 │   └── prompts.py             # system prompt
 └── agent.py                   # host-side CLI client (the deliverable)
 ```
