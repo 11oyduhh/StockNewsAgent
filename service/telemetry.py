@@ -5,10 +5,9 @@ forwards every LLM call (success or failure) into one trace row. Captures
 model, prompt / response shapes, token counts, cost, latency, tool-call
 names, error string.
 
-Adapted from the AgenticCRE ``litellm_telemetry.py`` pattern but with a
-single sink (the ``traces`` table) instead of a JSONL recorder bridge.
-Per-call ``metadata`` lets the caller stamp the ``task_id`` and
-``turn_index`` so we can group rows by run.
+Writes to a single sink — the ``traces`` table. Per-call ``metadata``
+lets the caller stamp the ``task_id`` and ``turn_index`` so rows can be
+grouped by run.
 
 Defensive: a failure in telemetry never breaks the LLM call path — the
 write is wrapped in try/except, errors only logged.
