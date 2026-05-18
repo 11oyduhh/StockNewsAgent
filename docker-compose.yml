@@ -76,9 +76,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-anthelion_dev_pw}
       POSTGRES_DB:       ${POSTGRES_DB:-anthelion}
     volumes:
-      # Mount the CSVs read-only. Files live at the repo root so the
-      # evaluator doesn't have to move anything; ingest reads from /data.
-      - ./:/data:ro
+      # The dataset CSVs, mounted read-only. They live in ./datasets and the
+      # ingest container reads them from /data.
+      - ./datasets:/data:ro
     depends_on:
       postgres:
         condition: service_healthy

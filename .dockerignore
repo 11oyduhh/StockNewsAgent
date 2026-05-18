@@ -4,6 +4,7 @@
 # pyproject.toml, uv.lock, service/, ingest/ingest.py.
 
 # Data — mounted into the ingest container at runtime, never built in.
+datasets/
 *.csv
 
 # Local Python environment + caches.
