@@ -94,7 +94,7 @@ class PostgresTraceLogger(CustomLogger):
             tool_names = _tool_call_summary(response_obj)
             tool_calls_json = json.dumps(tool_names) if tool_names else None
 
-            await db.writer().execute(
+            await db.pool().execute(
                 """
                 INSERT INTO traces
                     (task_id, turn_index, kind, model, prompt, response,

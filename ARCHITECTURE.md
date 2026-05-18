@@ -27,16 +27,15 @@ graph TB
     CLI -->|"POST /run {task}"| AGENT
     CSV -.->|"streamed COPY"| INGEST
     INGEST -->|"bulk load"| PG
-    AGENT -->|"writer pool"| PGB
+    AGENT -->|"connection pool"| PGB
     PGB --> PG
-    AGENT -->|"reader pool — read-only role, direct"| PG
 ```
 
 - **ingest** runs once, populates Postgres, exits. The agent service
   waits for it via `depends_on: service_completed_successfully`.
-- The **writer pool** goes through pgbouncer (the hot path — production
-  shape). The **reader pool** (used only by the `sql()` tool) connects
-  directly as a read-only role with a statement timeout.
+- All agent traffic goes through **pgbouncer** via a single asyncpg pool
+  (the hot path — production shape). ingest connects to Postgres directly,
+  bypassing pgbouncer, because bulk `COPY` wants a stable direct connection.
 
 ---
 
@@ -124,9 +123,8 @@ graph LR
         I2["headline_topic_frequency"]
         I3["lookup_security"]
     end
-    subgraph LOADERS["loaders — return a handle"]
+    subgraph LOADERS["loader — returns a handle"]
         L1["load_prices"]
-        L2["load_dataset_sql"]
     end
     subgraph ANALYSIS["analysis tools — operate on a handle"]
         A1["dataset_describe"]
@@ -143,9 +141,7 @@ graph LR
     I2 --> DB
     I3 --> DB
     L1 --> DB
-    L2 -.->|"SELECT only"| DB
     L1 --> REG
-    L2 --> REG
     REG --> A1
     REG --> A2
     REG --> A3
@@ -154,12 +150,12 @@ graph LR
     A3 -->|"new handle"| REG
 ```
 
-The model calls a loader, gets a handle (`ds_1`), then calls analysis tools
+The model calls the loader, gets a handle (`ds_1`), then calls analysis tools
 on it. `dataset_rolling` produces a derived dataset, so it writes a new
-handle back. `load_dataset_sql` is the guarded escape hatch (read-only role,
-statement timeout, outer `LIMIT`) for shapes the structured loaders don't
-cover — e.g. a SQL join of headline counts to prices. The analysis menu is
-fixed: requests outside it (LSTM, custom models) are declined, not faked.
+handle back. The analysis menu is fixed: requests outside it (LSTM, custom
+models) are declined, not faked. An earlier iteration had a `load_dataset_sql`
+escape hatch for model-authored SQL; it was removed (unbounded capability +
+a connection-pooling liability) — see DECISIONS.md.
 
 ---
 

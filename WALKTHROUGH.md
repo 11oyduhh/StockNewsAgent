@@ -30,13 +30,12 @@ Everything runs in containers defined by `docker-compose.yml`:
 
 1. **postgres** — Postgres 16. Holds the data tables, the full-text
    search indexes, and the `traces` observability table. Its schema is
-   created on first boot from `db/01-schema.sql`; a read-only role for
-   the agent's `sql()` tool is created by `db/02-setup-roles.sh`.
+   created on first boot from `db/01-schema.sql`.
 
 2. **pgbouncer** — a connection pooler in front of Postgres. Each real
    Postgres connection is relatively expensive; pgbouncer lets the
    agent open cheap connections and multiplexes them onto a small pool.
-   It fronts the agent's *writer* traffic — the hot path, and the place
+   It fronts all of the agent's traffic — the hot path, and the place
    production concerns (scaling, connection limits) attach.
 
 3. **ingest** — a one-shot job. It streams the six CSV files into
@@ -109,14 +108,13 @@ three kinds.
 | `headline_topic_frequency` | Counts of matching headlines bucketed by day/week/month/year |
 | `lookup_security` | Find a ticker by company name or symbol |
 
-**Loaders** pull a potentially large result set into a server-side pandas
-DataFrame and return only a *handle* (`ds_1`) + the dataset's shape,
+The **loader** pulls a potentially large result set into a server-side pandas
+DataFrame and returns only a *handle* (`ds_1`) + the dataset's shape,
 columns, and a tiny head sample — never the bulk rows:
 
 | Tool | What it does |
 |---|---|
 | `load_prices` | A ticker's daily OHLCV + a derived `daily_return` column |
-| `load_dataset_sql` | A read-only SELECT/WITH query — for joins/aggregations the loaders don't cover |
 
 **Analysis tools** operate on a handle and return small results:
 
@@ -137,10 +135,14 @@ LSTM, train XGBoost) have no tool, and the agent declines them rather than
 improvising.
 
 Full-text search uses Postgres `tsvector` with GIN indexes — real keyword
-search with stemming and ranking, not `LIKE` scans. `load_dataset_sql`
-runs through a separate **read-only database role** with a per-connection
-statement timeout, and wraps the query in an outer `LIMIT` — even a wild
-query cannot write data, run forever, or exhaust memory.
+search with stemming and ranking, not `LIKE` scans.
+
+Every tool is a hardcoded, reviewed query — there is no path for
+model-authored SQL to reach the database. An earlier iteration had a
+`load_dataset_sql` escape hatch (the agent could run read-only `SELECT`s);
+it was removed because arbitrary SQL is an unbounded capability that
+contradicts the fixed analysis menu, and its connection path bypassed
+pgbouncer. See DECISIONS.md for the full reasoning.
 
 ## Context compaction
 
@@ -180,7 +182,6 @@ never break the actual agent run.
 ```
 docker-compose.yml      the four services, wired together
 db/01-schema.sql        tables, GIN full-text indexes, traces table
-db/02-setup-roles.sh    the read-only role for load_dataset_sql
 ingest/ingest.py        streamed CSV → Postgres
 service/main.py         FastAPI app — POST /run, GET /healthz
 service/loop.py         the agent loop (the heart of it)
@@ -188,7 +189,7 @@ service/tools.py        the tool registry + dispatcher
 service/datasets.py     the per-run dataset registry (handles)
 service/compaction.py   context compaction
 service/telemetry.py    LiteLLM → traces callback
-service/db.py           the writer + reader connection pools
+service/db.py           the asyncpg connection pool
 service/prompts.py      the system prompt
 agent.py                the host-side CLI client
 ```

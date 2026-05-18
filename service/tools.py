@@ -4,7 +4,7 @@ Two kinds of tools:
 
 * **Inline tools** return small results directly (``headline_search``,
   ``headline_topic_frequency``, ``lookup_security``).
-* **Loaders** (``load_prices``, ``load_dataset_sql``) pull a potentially
+* **Loaders** (``load_prices``) pull a potentially
   large result set into a server-side pandas DataFrame held in the run's
   :class:`~service.datasets.DatasetRegistry`, and return only a *handle* +
   shape/schema/head. **Analysis tools** (``dataset_*``) then operate on a
@@ -75,6 +75,16 @@ def _records_to_frame(rows: list[asyncpg.Record]) -> pd.DataFrame:
 # ── Inline tool 1: headline_search ─────────────────────────────────────
 
 
+def _parse_optional_date(value: str | None) -> date | None:
+    """ISO ``YYYY-MM-DD`` string → ``date`` (or ``None``).
+
+    asyncpg binds ``date`` parameters as :class:`datetime.date`, not strings —
+    the agent supplies ISO strings, so they must be parsed here. Raises
+    ``ValueError`` on malformed input; callers surface it as a tool error.
+    """
+    return date.fromisoformat(value) if value else None
+
+
 async def headline_search(
     query: str,
     source: str = "all",
@@ -91,7 +101,12 @@ async def headline_search(
     """
     limit = max(1, min(int(limit), 50))
     source = (source or "all").lower()
-    pool = db.writer()
+    try:
+        start = _parse_optional_date(start_date)
+        end = _parse_optional_date(end_date)
+    except ValueError as exc:
+        return {"error": f"bad date — use ISO YYYY-MM-DD ({exc})"}
+    pool = db.pool()
     results: list[dict] = []
 
     if source in ("abc", "all") and not ticker:
@@ -111,8 +126,8 @@ async def headline_search(
             LIMIT $4
             """,
             query,
-            start_date,
-            end_date,
+            start,
+            end,
             limit,
         )
         results.extend(_json_safe(rows))
@@ -139,8 +154,8 @@ async def headline_search(
             query,
             src_filter,
             ticker,
-            start_date,
-            end_date,
+            start,
+            end,
             limit,
         )
         results.extend(_json_safe(rows))
@@ -172,8 +187,13 @@ async def headline_topic_frequency(
     if granularity not in ("day", "week", "month", "year"):
         return {"error": f"invalid granularity {granularity!r}; use day|week|month|year"}
     source = (source or "all").lower()
+    try:
+        start = _parse_optional_date(start_date)
+        end = _parse_optional_date(end_date)
+    except ValueError as exc:
+        return {"error": f"bad date — use ISO YYYY-MM-DD ({exc})"}
     parts: list[asyncpg.Record] = []
-    pool = db.writer()
+    pool = db.pool()
 
     if source in ("abc", "all"):
         rows = await pool.fetch(
@@ -189,8 +209,8 @@ async def headline_topic_frequency(
             ORDER BY bucket
             """,
             query,
-            start_date,
-            end_date,
+            start,
+            end,
         )
         parts.extend(rows)
 
@@ -211,8 +231,8 @@ async def headline_topic_frequency(
             """,
             query,
             src_filter,
-            start_date,
-            end_date,
+            start,
+            end,
         )
         parts.extend(rows)
 
@@ -237,7 +257,7 @@ async def headline_topic_frequency(
 
 async def lookup_security(name_or_ticker: str) -> dict:
     """Find securities by exact ticker or fuzzy name match (ILIKE)."""
-    pool = db.writer()
+    pool = db.pool()
     rows = await pool.fetch(
         """
         SELECT ticker, security_name, sector, sub_industry, address,
@@ -266,14 +286,21 @@ async def load_prices(
     Returns a handle + shape/schema/head — not the rows. Run the
     ``dataset_*`` analysis tools on the handle.
     """
-    pool = db.writer()
+    # asyncpg binds `date` params as datetime.date, not ISO strings — convert
+    # the agent-supplied strings before they reach the driver.
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+    except ValueError as exc:
+        return {"error": f"bad date — use ISO YYYY-MM-DD ({exc})"}
+    pool = db.pool()
     rows = await pool.fetch(
         """
         WITH p AS (
             SELECT date, open, high, low, close, volume,
                    LAG(close) OVER (ORDER BY date) AS prev_close
             FROM prices
-            WHERE ticker = upper($1) AND date BETWEEN $2::date AND $3::date
+            WHERE ticker = upper($1) AND date BETWEEN $2 AND $3
         )
         SELECT date::text AS date, open, high, low, close, volume,
                CASE WHEN prev_close IS NULL OR prev_close = 0 THEN NULL
@@ -282,8 +309,8 @@ async def load_prices(
         ORDER BY date
         """,
         ticker,
-        start_date,
-        end_date,
+        start,
+        end,
     )
     if not rows:
         return {
@@ -294,55 +321,6 @@ async def load_prices(
     handle = registry.put(df)
     meta = registry.describe(handle)
     meta["loaded"] = f"daily prices for {ticker.upper()}, {start_date}..{end_date}"
-    return meta
-
-
-# ── Loader 2: load_dataset_sql ─────────────────────────────────────────
-
-
-_SQL_PREFIXES = ("SELECT", "WITH")
-
-
-async def load_dataset_sql(registry: DatasetRegistry, query: str) -> dict:
-    """Run a read-only SQL query and load the result into a dataset.
-
-    SELECT / WITH only. Use this for joins, aggregations, or any shape the
-    structured loaders don't cover (e.g. daily headline counts joined to
-    prices for a correlation). Returns a handle, not rows.
-    """
-    q = (query or "").strip().rstrip(";")
-    if not q:
-        return {"error": "empty query"}
-    if not q.upper().lstrip("(").startswith(_SQL_PREFIXES):
-        return {"error": "only SELECT or WITH queries are permitted"}
-    cap = int(os.environ.get("AGENT_DATASET_MAX_ROWS", "200000"))
-    wrapped = f"SELECT * FROM (\n{q}\n) _wrapped LIMIT {cap + 1}"
-    try:
-        async with db.reader().acquire() as conn:
-            records = await conn.fetch(wrapped)
-    except Exception as exc:
-        return {"error": str(exc)}
-    if not records:
-        return {"error": "query returned 0 rows"}
-    truncated = len(records) > cap
-    if truncated:
-        records = records[:cap]
-    df = _records_to_frame(records)
-    handle = registry.put(df)
-    meta = registry.describe(
-        handle,
-        truncated=truncated,
-        total_rows=None,
-        note=(
-            (
-                f"query returned more than {cap} rows; loaded the first {cap}. "
-                "Add aggregation or a tighter filter."
-            )
-            if truncated
-            else None
-        ),
-    )
-    meta["loaded"] = "sql query result"
     return meta
 
 
@@ -452,8 +430,8 @@ async def dataset_correlation(
 ) -> dict:
     """Pearson correlation between two numeric columns of one dataset.
 
-    For cross-dataset correlation, load a single joined frame via
-    ``load_dataset_sql`` (join in SQL on date), then correlate within it.
+    Operates within a single loaded frame — e.g. volume vs daily_return
+    on a price dataset.
     """
     try:
         df = registry.get(handle)
@@ -641,28 +619,6 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "load_dataset_sql",
-            "description": (
-                "Run a read-only SQL query (SELECT/WITH only) and load the result into a "
-                "dataset; returns a handle, not rows. Use for joins/aggregations the structured "
-                "loaders don't cover — e.g. daily headline counts joined to prices for a "
-                "correlation. Then use the dataset_* analysis tools on the handle."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "A SELECT or WITH ... SELECT query.",
-                    }
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "dataset_describe",
             "description": "Per-column summary statistics (count, mean, std, min/max, quartiles) for a loaded dataset.",
             "parameters": {
@@ -768,7 +724,6 @@ _DISPATCH: dict[str, _ToolFn] = {
     "headline_topic_frequency": headline_topic_frequency,
     "lookup_security": lookup_security,
     "load_prices": load_prices,
-    "load_dataset_sql": load_dataset_sql,
     "dataset_describe": dataset_describe,
     "dataset_sample": dataset_sample,
     "dataset_rolling": dataset_rolling,
@@ -779,7 +734,6 @@ _DISPATCH: dict[str, _ToolFn] = {
 # Tools that operate on the per-run dataset registry — dispatch injects it.
 _REGISTRY_TOOLS = {
     "load_prices",
-    "load_dataset_sql",
     "dataset_describe",
     "dataset_sample",
     "dataset_rolling",

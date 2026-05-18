@@ -1,7 +1,7 @@
 """Per-run dataset registry.
 
-Heavy data tools (``load_prices``, ``load_dataset_sql``) pull a query result
-into a pandas DataFrame held here and return only a *handle* plus the frame's
+The loader (``load_prices``) pulls a query result
+into a pandas DataFrame held here and returns only a *handle* plus the frame's
 shape / schema / a tiny head sample. Analysis tools (``dataset_*``) then
 operate on the handle. The agent never receives bulk rows — large tool
 results are eliminated by construction rather than capped after the fact.
