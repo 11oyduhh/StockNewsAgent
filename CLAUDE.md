@@ -24,8 +24,8 @@ Evaluation criterion: identifying what a production-grade agent platform actuall
 - **Language:** 100% Python where possible
 - **LLM:** LiteLLM as the provider/framework abstraction
 - **Storage:** Postgres 16 in-container, with `tsvector` FTS and a pgbouncer connection pooler in front. See DECISIONS.md for the SQLite→Postgres rationale (data volume + production-shape demonstration).
-- **Context management / compaction:** take the *pattern* from `/Users/lloyd/Desktop/myprojects/repos/cre1/AgenticCRE/src/common/agents/compaction.py` as inspiration — that repo is a much larger CRE-specific application; don't copy-paste, extract the idea and simplify for this scope
-- **Telemetry:** same treatment for `/Users/lloyd/Desktop/myprojects/repos/cre1/AgenticCRE/src/common/utils/litellm_telemetry.py` — pattern, not copy-paste
+- **Context management / compaction:** deterministic compaction — summarize old turns, keep the recent tail verbatim, with tool_use↔tool_result pair-safety. Pure aggregation, no LLM-driven summarization. See `service/compaction.py`.
+- **Telemetry:** a LiteLLM `CustomLogger` callback writing one row per LLM call to the Postgres `traces` table. See `service/telemetry.py`.
 - **Secrets:** the user supplies a `.env` with API keys — read from env, do not hardcode, do not commit the file
 
 ## Repo layout
@@ -43,7 +43,7 @@ anthelion_take_home/
 │   ├── main.py                # FastAPI lifespan + POST /run + GET /healthz + GET /traces/{id}
 │   ├── loop.py                # agent loop (LiteLLM tool-use + compaction)
 │   ├── tools.py               # 9-tool registry + dispatcher
-│   ├── compaction.py          # simplified port of the AgenticCRE pattern
+│   ├── compaction.py          # deterministic conversation compaction
 │   ├── telemetry.py           # LiteLLM CustomLogger → traces rows
 │   ├── db.py                  # asyncpg connection pool (via pgbouncer)
 │   └── prompts.py             # system prompt

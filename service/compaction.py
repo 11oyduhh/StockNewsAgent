@@ -1,21 +1,18 @@
 """Deterministic in-session conversation compaction.
 
-Adapted from the AgenticCRE pattern (``compaction.py``), itself modelled
-on claw-code's ``compact.rs``. Pure aggregation, no LLM-driven
-summarisation. Builds a structured ``<summary>`` blob from older turns;
-recent ``K`` turns kept verbatim. tool_use ↔ tool_result pair integrity
-preserved via boundary walk-back so Anthropic's API never sees an
-orphaned ``tool_result``.
+Pure aggregation — no LLM-driven summarisation, so it is deterministic
+and free. Builds a structured ``<summary>`` blob from older turns;
+recent ``K`` turns are kept verbatim. tool_use ↔ tool_result pair
+integrity is preserved via boundary walk-back so Anthropic's API never
+sees an orphaned ``tool_result``.
 
-Simplifications vs the reference:
+Design notes:
 
-* No CRE-specific signal extraction (URLs, captcha sitekeys, parcel
-  PINs, ``[KEY DECISION]`` markers) — none apply to our domain.
-* Summary blob is shorter: role counts, tools used, recent user
-  requests, last assistant statement, condensed timeline.
-* Default trigger threshold lowered to 20k (env-overridable) because
-  our conversations are shorter and we want compaction to actually
-  exercise during multi-tool runs.
+* The summary blob is intentionally compact: role counts, tools used,
+  recent user requests, last assistant statement, condensed timeline.
+* The default trigger threshold is 20k cumulative input tokens
+  (env-overridable) — low, because our conversations are short and we
+  want compaction to actually exercise during multi-tool runs.
 
 Public surface:
 
@@ -83,7 +80,7 @@ class CompactedMessages:
 
 
 def estimate_tokens(content: Any) -> int:
-    """``len(rendered) // 4 + 1`` heuristic. Matches claw-code's estimator."""
+    """``len(rendered) // 4 + 1`` — a cheap character-count token estimate."""
     if isinstance(content, str):
         return len(content) // 4 + 1
     if isinstance(content, list):
