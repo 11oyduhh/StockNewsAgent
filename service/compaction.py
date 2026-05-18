@@ -63,9 +63,6 @@ class CompactionConfig:
     auto_trigger_input_tokens: int = 20_000
     """Cumulative session input-token threshold."""
 
-    per_tool_result_char_cap: int = 8192
-    """Truncation cap for individual tool-result bodies in the summary."""
-
 
 @dataclass
 class CompactedMessages:

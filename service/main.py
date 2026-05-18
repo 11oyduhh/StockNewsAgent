@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     await db.init_pools()
     litellm.callbacks = [PostgresTraceLogger()]
-    logger.info("agent service ready — pools warmed, telemetry wired")
+    logger.info("agent service ready — pool warmed, telemetry wired")
     try:
         yield
     finally:
