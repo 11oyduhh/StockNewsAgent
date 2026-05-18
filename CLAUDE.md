@@ -47,6 +47,7 @@ anthelion_take_home/
 │   ├── telemetry.py           # LiteLLM CustomLogger → traces rows
 │   ├── db.py                  # asyncpg connection pool (via pgbouncer)
 │   └── prompts.py             # system prompt
+├── tests/                     # pytest unit tests (compaction)
 └── agent.py                   # host-side CLI client (the deliverable)
 ```
 
@@ -65,6 +66,7 @@ uv sync                          # create .venv with runtime + dev deps
 uv run black .                   # auto-format
 uv run flake8                    # lint
 uv run mypy service ingest agent.py   # type-check
+uv run pytest                    # unit tests (compaction)
 ```
 
 `flake8` reads its config from `.flake8` — flake8 has no native `pyproject.toml` support, and a dedicated file is portable without a plugin. Long-line rule is suppressed per-file for `service/prompts.py` and `service/tools.py` — both contain LLM-facing string content where line-length is a meaningless metric.
@@ -82,4 +84,4 @@ Ingestion needs to be deliberate (streamed/batched), not a naive `pd.read_csv` i
 
 - Single-command bring-up is a hard requirement — `docker compose up` (or equivalent) must produce a working end-to-end demo, including ingestion if the DB isn't already populated.
 - Favor a thin, legible vertical slice over breadth. The evaluator is looking for coherent platform thinking, not many features.
-- `DECISIONS.md` is graded — keep notes on tradeoffs as you make them so writing it isn't archaeology at the end.
+- `DECISIONS.md` keep notes on tradeoffs as we make them so writing it isn't archaeology at the end.
