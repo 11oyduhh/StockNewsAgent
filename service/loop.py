@@ -66,6 +66,23 @@ def _config_from_env() -> compaction.CompactionConfig:
     )
 
 
+# Anthropic extended thinking — always on. It surfaces the model's reasoning,
+# which the telemetry callback captures into traces and GET /traces/{task_id}
+# exposes, so a run is auditable for *why* the agent chose each tool. Not an
+# operational knob: it's a core observability decision for this platform.
+#
+# The interleaved-thinking beta makes the model reason before every tool call,
+# not just the first turn. Anthropic requires max_tokens > budget_tokens; the
+# +6144 leaves headroom for the answer itself.
+_THINKING_BUDGET_TOKENS = 10_000
+
+THINKING_KWARGS: dict[str, Any] = {
+    "thinking": {"type": "enabled", "budget_tokens": _THINKING_BUDGET_TOKENS},
+    "max_tokens": _THINKING_BUDGET_TOKENS + 6144,
+    "extra_headers": {"anthropic-beta": "interleaved-thinking-2025-05-14"},
+}
+
+
 def _response_cost(response: Any) -> float:
     """Pull a $ cost off a LiteLLM response, tolerating a few API shapes."""
     try:
@@ -130,6 +147,7 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
                 tools=tools.TOOL_DEFINITIONS,
                 tool_choice="auto",
                 metadata={"task_id": task_id, "turn_index": turn},
+                **THINKING_KWARGS,
             )
 
             usage = getattr(response, "usage", None)
@@ -144,6 +162,12 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
             assistant_dict: dict[str, Any] = {"role": "assistant"}
             if msg.content is not None:
                 assistant_dict["content"] = msg.content
+            # Extended thinking: the thinking blocks from a turn that produced
+            # tool calls MUST be carried back with the assistant message, or
+            # Anthropic rejects the next request. Preserve them verbatim.
+            thinking_blocks = getattr(msg, "thinking_blocks", None)
+            if thinking_blocks:
+                assistant_dict["thinking_blocks"] = thinking_blocks
             if getattr(msg, "tool_calls", None):
                 assistant_dict["tool_calls"] = [
                     {
@@ -223,6 +247,7 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
             model=model,
             messages=messages,
             metadata={"task_id": task_id, "turn_index": max_rounds_with_tool_calls},
+            **THINKING_KWARGS,
         )
         usage = getattr(response, "usage", None)
         if usage is not None:

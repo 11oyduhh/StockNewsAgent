@@ -44,12 +44,15 @@ Everything runs in containers defined by `docker-compose.yml`:
    successfully before it starts.
 
 4. **agent** — the FastAPI service that *is* the agent. It exposes
-   `POST /run` (execute a task) and `GET /healthz` (liveness). This is
-   where the LLM loop, the tools, compaction, and telemetry live.
+   `POST /run` (execute a task), `GET /healthz` (liveness), and
+   `GET /traces/{task_id}` (replay a run's telemetry). This is where
+   the LLM loop, the tools, compaction, and telemetry live.
 
 A host-side script, `agent.py`, is the client. It has no third-party
 dependencies — it just POSTs your task to the service and prints the
-answer plus a short run summary (turns, tokens, cost).
+answer plus a short run summary (turns, tokens, cost). With `--trace`
+it also prints the run's step-by-step telemetry timeline; `--trace-only
+<task_id>` inspects a past run.
 
 ## Ingestion
 
@@ -172,10 +175,21 @@ latency, and any error.
 LLM calls are captured by a LiteLLM callback (`service/telemetry.py`):
 a `CustomLogger` subclass that fires on every completion, success or
 failure, and writes a row. Tool calls are recorded by the agent loop
-directly. The result: any task can be replayed and audited after the
-fact, and cost/latency/error rates can be sliced by model or tool.
-The telemetry write is wrapped defensively — a logging failure can
-never break the actual agent run.
+directly. The telemetry write is wrapped defensively — a logging
+failure can never break the actual agent run.
+
+Collected telemetry you can't read is just theatre, so `GET
+/traces/{task_id}` exposes it: it replays a task as an ordered timeline
+of every LLM call and tool call, with token/cost/latency per step
+(`?verbose=true` adds the full prompts, responses, and tool I/O).
+`python agent.py "…" --trace` prints that timeline right after a run;
+`--trace-only <task_id>` inspects a past one.
+
+The agent also runs with **extended thinking** enabled, so each LLM
+call carries the model's reasoning. That reasoning is captured into
+`traces` and shown in the timeline — so you can audit not just *what*
+tool the agent picked but *why*. Any task can be replayed and audited
+after the fact, and cost/latency/error rates sliced by model or tool.
 
 ## Where to look in the code
 
@@ -183,7 +197,7 @@ never break the actual agent run.
 docker-compose.yml      the four services, wired together
 db/01-schema.sql        tables, GIN full-text indexes, traces table
 ingest/ingest.py        streamed CSV → Postgres
-service/main.py         FastAPI app — POST /run, GET /healthz
+service/main.py         FastAPI app — POST /run, GET /healthz, GET /traces/{id}
 service/loop.py         the agent loop (the heart of it)
 service/tools.py        the tool registry + dispatcher
 service/datasets.py     the per-run dataset registry (handles)

@@ -12,7 +12,11 @@ answer — all running via one `docker compose` command.
 cp .env.example .env          # then set ANTHROPIC_API_KEY
 docker compose up --build     # postgres + pgbouncer + ingest + agent
 python agent.py "headlines mentioning Apple in March 2014"
+python agent.py "how volatile was AAPL in 2013?" --trace   # + telemetry timeline
 ```
+
+`--trace` prints the run's step-by-step telemetry (every LLM call and tool call,
+with the model's reasoning); `--trace-only <task_id>` inspects a past run.
 
 ## Data setup
 
