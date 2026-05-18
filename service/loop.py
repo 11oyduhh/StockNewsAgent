@@ -37,7 +37,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import UUID, uuid4
 
 import litellm
@@ -46,6 +46,12 @@ from . import compaction, datasets, db, tools
 from .prompts import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+# run_agent can optionally stream progress: given an `on_event` hook it calls
+# it once per LLM call and once per tool call, so the /run/stream endpoint can
+# forward each step to the client live. When omitted (the plain /run path) the
+# loop behaves exactly as before — zero overhead.
+EventHook = Callable[[dict], Awaitable[None]]
 
 # Per-tool-call timeout. One hung tool shouldn't be able to stall a whole run.
 # `asyncio.wait_for` bounds awaitable work — the DB round-trips, which are where
@@ -108,7 +114,12 @@ def _response_cost(response: Any) -> float:
     return 0.0
 
 
-async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) -> AgentResult:
+async def run_agent(
+    task: str,
+    max_rounds_with_tool_calls: int | None = None,
+    *,
+    on_event: EventHook | None = None,
+) -> AgentResult:
     task_id = str(uuid4())
     model = os.environ.get("LITELLM_MODEL", "anthropic/claude-sonnet-4-6")
     if max_rounds_with_tool_calls is None:
@@ -150,6 +161,7 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
                     )
 
             # ── LLM call ──────────────────────────────────────────────
+            t_llm = time.time()
             response = await litellm.acompletion(
                 model=model,
                 messages=messages,
@@ -158,12 +170,15 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
                 metadata={"task_id": task_id, "turn_index": turn},
                 **THINKING_KWARGS,
             )
+            llm_latency_ms = int((time.time() - t_llm) * 1000)
 
             usage = getattr(response, "usage", None)
-            if usage is not None:
-                cumulative_input += int(getattr(usage, "prompt_tokens", 0) or 0)
-                total_output += int(getattr(usage, "completion_tokens", 0) or 0)
-            total_cost += _response_cost(response)
+            call_input = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
+            call_output = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
+            call_cost = _response_cost(response)
+            cumulative_input += call_input
+            total_output += call_output
+            total_cost += call_cost
 
             msg = response.choices[0].message
 
@@ -190,6 +205,22 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
                     for tc in msg.tool_calls
                 ]
             messages.append(assistant_dict)
+
+            if on_event is not None:
+                requested = [tc.function.name for tc in (getattr(msg, "tool_calls", None) or [])]
+                await on_event(
+                    {
+                        "type": "llm_call",
+                        "turn": turn,
+                        "model": model,
+                        "input_tokens": call_input,
+                        "output_tokens": call_output,
+                        "cost_usd": call_cost,
+                        "latency_ms": llm_latency_ms,
+                        "reasoning": getattr(msg, "reasoning_content", None),
+                        "tool_calls": requested or None,
+                    }
+                )
 
             # ── Done if no tool calls ─────────────────────────────────
             if not getattr(msg, "tool_calls", None):
@@ -259,22 +290,55 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
                     }
                 )
 
+                if on_event is not None:
+                    await on_event(
+                        {
+                            "type": "tool_call",
+                            "turn": turn,
+                            "tool_name": name,
+                            "latency_ms": latency_ms,
+                            "error": (
+                                tool_result.get("error") if isinstance(tool_result, dict) else None
+                            ),
+                        }
+                    )
+
         # Round budget exhausted with tool results still pending — the model
         # never got a turn to consume the last one. One tool-free call lets it
         # synthesize a final answer from the conversation history it already
         # has. ``tools`` is omitted entirely so the response can only be text.
+        t_llm = time.time()
         response = await litellm.acompletion(
             model=model,
             messages=messages,
             metadata={"task_id": task_id, "turn_index": max_rounds_with_tool_calls},
             **THINKING_KWARGS,
         )
+        llm_latency_ms = int((time.time() - t_llm) * 1000)
         usage = getattr(response, "usage", None)
-        if usage is not None:
-            cumulative_input += int(getattr(usage, "prompt_tokens", 0) or 0)
-            total_output += int(getattr(usage, "completion_tokens", 0) or 0)
-        total_cost += _response_cost(response)
-        final_text = response.choices[0].message.content or final_text
+        call_input = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
+        call_output = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
+        call_cost = _response_cost(response)
+        cumulative_input += call_input
+        total_output += call_output
+        total_cost += call_cost
+        synth_msg = response.choices[0].message
+        final_text = synth_msg.content or final_text
+
+        if on_event is not None:
+            await on_event(
+                {
+                    "type": "llm_call",
+                    "turn": max_rounds_with_tool_calls,
+                    "model": model,
+                    "input_tokens": call_input,
+                    "output_tokens": call_output,
+                    "cost_usd": call_cost,
+                    "latency_ms": llm_latency_ms,
+                    "reasoning": getattr(synth_msg, "reasoning_content", None),
+                    "tool_calls": None,
+                }
+            )
 
         return AgentResult(
             answer=final_text or "(no answer produced)",

@@ -29,9 +29,10 @@ python agent.py "How many headlines mention 'bushfire'?"
 python agent.py "Did news about Apple line up with its 2014 price moves?" --trace
 ```
 
-`--trace` prints the run's step-by-step telemetry — every LLM call and tool
-call, with the model's reasoning. `python agent.py --trace-only <task_id>`
-inspects a past run without re-running it.
+`--trace` streams the run live — each LLM call and tool call (with the model's
+reasoning) prints the moment it completes, so you can watch the agent work and
+`Ctrl-C` to abort it. `python agent.py --trace-only <task_id>` inspects a past
+run without re-running it.
 
 ## What it can do
 
