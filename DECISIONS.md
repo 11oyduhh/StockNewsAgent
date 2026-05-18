@@ -59,6 +59,8 @@ A living record of architectural decisions for this take-home: what we chose, wh
 
 - Each agent turn writes a row to `traces`: task_id, turn_index, model, prompt JSONB, response JSONB, tool_calls JSONB, token counts, cost, latency, error.
 - The LiteLLM telemetry callback feeds the same table — every LLM call captured uniformly regardless of where it originates.
+- **`GET /traces/{task_id}` makes the telemetry observable** — it replays a task as an ordered timeline of every LLM call and tool call (`?verbose=true` adds full prompts/responses/tool I/O). `python agent.py … --trace` prints that timeline after a run; `--trace-only <id>` inspects a past run. Collecting traces with no way to read them is theatre; this closes the loop. The endpoint is read-only and unauthenticated for the demo — in production it sits behind the same auth as `/run`.
+- **Extended thinking is enabled** (`AGENT_EXTENDED_THINKING`, with the interleaved-thinking beta). The model's reasoning is captured into `traces.response` and surfaced by the endpoint above, so a run can be audited for *why* the agent chose each tool, not just *what* it did. Thinking blocks are preserved across tool-result turns in `loop.py` (Anthropic rejects the conversation otherwise).
 - Stdout logs are structured (JSON) so a future log aggregator can ingest them without parsing changes.
 
 ## Known limitations (deliberate)

@@ -66,6 +66,27 @@ def _config_from_env() -> compaction.CompactionConfig:
     )
 
 
+def _thinking_kwargs() -> dict[str, Any]:
+    """LiteLLM kwargs for Anthropic extended thinking — or ``{}`` when disabled.
+
+    Extended thinking surfaces the model's reasoning, which the telemetry
+    callback captures into ``traces.response`` and ``GET /traces/{task_id}``
+    exposes. Anthropic requires ``max_tokens > budget_tokens``, so we add
+    headroom for the answer itself.
+    """
+    if os.environ.get("AGENT_EXTENDED_THINKING", "1").lower() not in ("1", "true", "yes"):
+        return {}
+    budget = int(os.environ.get("AGENT_THINKING_BUDGET_TOKENS", "2048"))
+    return {
+        "thinking": {"type": "enabled", "budget_tokens": budget},
+        "max_tokens": budget + 6144,
+        # Interleaved thinking: without this beta the model only thinks on the
+        # first turn; with it, it reasons before each tool call too — so the
+        # trace shows the agent's reasoning at every decision point.
+        "extra_headers": {"anthropic-beta": "interleaved-thinking-2025-05-14"},
+    }
+
+
 def _response_cost(response: Any) -> float:
     """Pull a $ cost off a LiteLLM response, tolerating a few API shapes."""
     try:
@@ -90,6 +111,7 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
     # Guard the degenerate 0 / negative case — the env var is unvalidated.
     max_rounds_with_tool_calls = max(1, max_rounds_with_tool_calls)
     cfg = _config_from_env()
+    thinking_kwargs = _thinking_kwargs()
 
     # Per-run dataset store — heavy tools load into it, analysis tools read it,
     # and it is cleared in the finally below so memory is bounded to the run.
@@ -130,6 +152,7 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
                 tools=tools.TOOL_DEFINITIONS,
                 tool_choice="auto",
                 metadata={"task_id": task_id, "turn_index": turn},
+                **thinking_kwargs,
             )
 
             usage = getattr(response, "usage", None)
@@ -144,6 +167,12 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
             assistant_dict: dict[str, Any] = {"role": "assistant"}
             if msg.content is not None:
                 assistant_dict["content"] = msg.content
+            # Extended thinking: the thinking blocks from a turn that produced
+            # tool calls MUST be carried back with the assistant message, or
+            # Anthropic rejects the next request. Preserve them verbatim.
+            thinking_blocks = getattr(msg, "thinking_blocks", None)
+            if thinking_blocks:
+                assistant_dict["thinking_blocks"] = thinking_blocks
             if getattr(msg, "tool_calls", None):
                 assistant_dict["tool_calls"] = [
                     {
@@ -223,6 +252,7 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
             model=model,
             messages=messages,
             metadata={"task_id": task_id, "turn_index": max_rounds_with_tool_calls},
+            **thinking_kwargs,
         )
         usage = getattr(response, "usage", None)
         if usage is not None:
