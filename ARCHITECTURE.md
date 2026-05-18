@@ -65,7 +65,7 @@ sequenceDiagram
 
         alt message has tool_calls
             loop each tool call
-                L->>T: dispatch(name, args)
+                L->>T: dispatch(name, args, registry)
                 T->>DB: SQL query (FTS / prices / ...)
                 DB-->>T: rows
                 T-->>L: JSON result
@@ -110,9 +110,9 @@ flowchart TD
 
 ## 4. Tools — load then analyze
 
-Tools split in two kinds. **Inline tools** return small results straight to
-the model. **Loaders** pull a large result set into a server-side pandas
-DataFrame (the per-run `DatasetRegistry`) and return only a *handle* + shape.
+Tools split in three kinds. **Inline tools** return small results straight to
+the model. The **loader** pulls a large result set into a server-side pandas
+DataFrame (the per-run `DatasetRegistry`) and returns only a *handle* + shape.
 **Analysis tools** compute over a handle and return small results — so bulk
 rows never enter the model's context.
 

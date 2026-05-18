@@ -40,25 +40,21 @@ The image is pinned to `postgres:16` — the **official** Postgres image (a Dock
 
 ## Data layer
 
-- **Ingestion:** a one-shot `ingest` service in docker-compose. Streams each CSV via `psycopg.copy()` (binary COPY is dramatically faster than INSERT loops). Idempotent — safe to re-run; uses `INSERT … ON CONFLICT DO NOTHING` against natural keys or a content-hash unique constraint where no natural key exists.
-- **Schema (planned):**
-  - `abc_headlines(publish_date DATE, headline TEXT)` — Australian general news.
-  - `us_headlines(headline_id BIGSERIAL, source TEXT, published_at TIMESTAMPTZ, headline TEXT, ticker TEXT)` — both US sources unioned with a `source` discriminator (`'analyst' | 'partner'`).
-  - `securities(ticker TEXT PRIMARY KEY, security_name, sector, sub_industry, address, date_first_added DATE, cik)`.
-  - `prices(date DATE, ticker TEXT, open NUMERIC, high NUMERIC, low NUMERIC, close NUMERIC, volume BIGINT, PRIMARY KEY (ticker, date))`.
-  - `fundamentals(ticker TEXT, period_end DATE, …wide metric columns…)`.
-  - `traces(id BIGSERIAL, task_id UUID, turn_index INT, ts TIMESTAMPTZ DEFAULT now(), model TEXT, role TEXT, prompt JSONB, response JSONB, tool_calls JSONB, input_tokens INT, output_tokens INT, cost_usd NUMERIC, latency_ms INT, error TEXT)`.
-- **Indexes:**
-  - GIN over `to_tsvector('english', headline)` on `abc_headlines` and `us_headlines`.
-  - B-tree on `published_at` and `ticker` for `us_headlines`.
-  - B-tree on `(ticker, date)` for `prices` (covered by PK).
-- **pgbouncer:** transaction-pooling mode. The agent service connects to `pgbouncer:6432`. Note: transaction-pooling disables prepared statements, so `asyncpg` is configured with `statement_cache_size=0`.
+The full DDL lives in [`db/01-schema.sql`](db/01-schema.sql), applied once on first boot. The decisions worth recording:
+
+- **Ingestion:** a one-shot `ingest` service. Big CSVs are streamed via Postgres `COPY` into a `TEMP` staging table, then folded into the real table with `INSERT … SELECT … ON CONFLICT DO NOTHING`; the two small CSVs use `executemany`. `COPY` is far faster than INSERT loops, and the staging-table + `ON CONFLICT` step makes re-runs idempotent — backed by a row-count guard that skips a stage entirely once its table is populated.
+- **Two headline tables, not one.** `abc_headlines` (Australian general news — just a date and a headline) and `us_headlines` (US ticker-tagged — both source CSVs unioned under a `'analyst' | 'partner'` discriminator, with optional `ticker` and `publisher`). The domains and columns differ enough that a single table would be a wall of nullable columns.
+- **Idempotency via natural keys.** Every table has a `UNIQUE`/`PRIMARY KEY` on its natural key (e.g. `abc_headlines (publish_date, headline)`); `us_headlines` uses `UNIQUE NULLS NOT DISTINCT` (PG 15+) so rows with a NULL `ticker` still dedupe on re-ingest.
+- **Generated FTS columns.** `headline_tsv` is a `GENERATED ALWAYS AS (to_tsvector('english', headline)) STORED` column with a GIN index — full-text search is maintained by the database, not the application.
+- **Fundamentals as `JSONB`.** The 79-column source has irregular header names; one `JSONB` `data` column avoids a brittle 79-way mapping, with `for_year` hoisted out as the natural filter.
+- **`traces`** — one row per LLM call *or* tool call, `kind` discriminating the two. The observability sink; see the Observability section.
+- **pgbouncer:** transaction-pooling mode; the agent connects to `pgbouncer:6432`. Transaction pooling disables prepared statements, so `asyncpg` is configured with `statement_cache_size=0`.
 
 ## Agent design
 
-- **Loop:** LiteLLM tool-use with a tool-use round budget (`max_rounds_with_tool_calls`, default 10), per-tool timeout, and compaction triggered above a configurable cumulative-input-token threshold (default 20k). When the budget is exhausted with tool calls still pending, the model never got a turn to consume the last tool result — so one final tool-free `acompletion` call lets it synthesize an answer from the history. A capped run therefore still ends with a real answer, not a stub, at a worst-case cost of budget + 1 LLM calls.
+- **Loop:** LiteLLM tool-use with a tool-use round budget (`max_rounds_with_tool_calls`, default 10), a 30-second per-tool-call timeout so one hung tool can't stall a run, and compaction triggered above a configurable cumulative-input-token threshold (default 20k). When the budget is exhausted with tool calls still pending, the model never got a turn to consume the last tool result — so one final tool-free `acompletion` call lets it synthesize an answer from the history. A capped run therefore still ends with a real answer, not a stub, at a worst-case cost of budget + 1 LLM calls.
 - **Tool model — load then analyze.** Tools split in three kinds. *Inline tools* (`headline_search`, `headline_topic_frequency`, `lookup_security`) return small results directly. The *loader* (`load_prices`) pulls a potentially large result set into a server-side pandas DataFrame held in the run's `DatasetRegistry` and returns only a **handle** plus the frame's shape, schema, and a tiny head sample. *Analysis tools* (`dataset_describe`, `dataset_sample`, `dataset_rolling`, `dataset_correlation`, `dataset_arima`) compute over a handle and return small results. The agent never receives bulk data rows.
-- **Why this shape.** A single multi-year `price_history` result was ~47k tokens of raw rows fed straight into context. Truncating loses data the agent may need; conversation compaction cannot help — it summarizes *old* turns, not a fresh oversized result. The load-then-analyze split eliminates large tool results *by construction*: raw rows never leave the server, so there is no oversized result to cap. Compaction is left to do only its real job (history accumulation).
+- **Why this shape.** A multi-year daily price history is ~47k tokens of raw rows; a naive tool would feed all of it straight into context. Truncating loses data the agent may need; conversation compaction cannot help — it summarizes *old* turns, not a fresh oversized result. The load-then-analyze split eliminates large tool results *by construction*: raw rows never leave the server, so there is no oversized result to cap. Compaction is left to do only its real job (history accumulation).
 - **Dataset lifecycle.** One `DatasetRegistry` per run, cleared in a `finally` when the run ends. In-process memory; no TTL or eviction because the lifetime is bounded to a single task. Loaders apply a generous RAM row cap (`AGENT_DATASET_MAX_ROWS`, default 200k) — a memory guard, distinct from the (eliminated) context-size problem.
 - **Fixed analysis menu = deliberate capability boundary.** The `dataset_*` tools are the complete supported operation set. Requests outside it (fit an LSTM, train XGBoost, bespoke econometrics) have no tool; the system prompt instructs the agent to decline rather than improvise. ARIMA is retained as one analysis op, honestly framed as a naive baseline.
 - **Misapplication guard.** The advertised tool list is static (low complexity). Rather than dynamically varying it per dataset type, each analysis tool validates the handle's schema (column exists, dtype numeric where required) and returns a clear error the agent recovers from — cheaper and more robust than maintaining a dataset-type→tool mapping.
@@ -67,7 +63,7 @@ The image is pinned to `postgres:16` — the **official** Postgres image (a Dock
 
 ## Observability
 
-- Each agent turn writes a row to `traces`: task_id, turn_index, model, prompt JSONB, response JSONB, tool_calls JSONB, token counts, cost, latency, error.
+- Each LLM call and each tool call writes a row to `traces`: task_id, turn_index, `kind` (`llm_call` or `tool_call`), model, prompt/response JSONB for LLM calls or tool name/input/output JSONB for tool calls, plus token counts, cost, latency, and any error.
 - The LiteLLM telemetry callback feeds the same table — every LLM call captured uniformly regardless of where it originates.
 - **`GET /traces/{task_id}` makes the telemetry observable** — it replays a task as an ordered timeline of every LLM call and tool call (`?verbose=true` adds full prompts/responses/tool I/O). `python agent.py … --trace` prints that timeline after a run; `--trace-only <id>` inspects a past run. Collecting traces with no way to read them is theatre; this closes the loop. The endpoint is read-only and unauthenticated for the demo — in production it sits behind the same auth as `/run`.
 - **Extended thinking is always on** (with the interleaved-thinking beta, so the model reasons before *every* tool call). This is a fixed design choice, not a configurable knob — observability is the whole point, so there is no value in being able to switch it off. The model's reasoning is captured into `traces.response` and surfaced by the endpoint above, so a run can be audited for *why* the agent chose each tool, not just *what* it did. Thinking blocks are preserved across tool-result turns in `loop.py`, and compaction enforces the same invariant — a post-compaction integrity backstop abandons the compaction if a preserved tool-calling turn ever loses its thinking block (Anthropic rejects the conversation otherwise).
@@ -101,6 +97,5 @@ The image is pinned to `postgres:16` — the **official** Postgres image (a Dock
 ## Open items
 
 - Exact compaction trigger thresholds for our (likely shorter) conversations — tune empirically.
-- Initial agent system prompt and seed examples.
 - Eval fixture set (golden tasks + expected behavior).
 - ~~Whether to provide a single composite tool vs. primitives.~~ Resolved: primitives — loaders + a fixed analysis menu the agent composes (load → describe → sample/rolling/correlate/arima).
