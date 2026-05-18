@@ -34,14 +34,14 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await db.init_pools()
+    await db.init_pool()
     litellm.callbacks = [PostgresTraceLogger()]
     logger.info("agent service ready — pool warmed, telemetry wired")
     try:
         yield
     finally:
         litellm.callbacks = []
-        await db.close_pools()
+        await db.close_pool()
 
 
 app = FastAPI(title="anthelion-agent", lifespan=lifespan)

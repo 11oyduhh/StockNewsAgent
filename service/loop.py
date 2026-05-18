@@ -31,6 +31,7 @@ Returns an :class:`AgentResult` with the answer plus a small run summary
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -45,6 +46,14 @@ from . import compaction, datasets, db, tools
 from .prompts import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+# Per-tool-call timeout. One hung tool shouldn't be able to stall a whole run.
+# `asyncio.wait_for` bounds awaitable work — the DB round-trips, which are where
+# a real hang (a lock, a pathological query) would happen. The dataset_* tools'
+# in-memory pandas work is CPU-bound and not interruptible mid-call, but it is
+# already bounded by the loader's row cap. 30s is generous: only a genuine hang
+# trips it.
+_TOOL_TIMEOUT_SECONDS = 30
 
 
 @dataclass
@@ -205,7 +214,18 @@ async def run_agent(task: str, max_rounds_with_tool_calls: int | None = None) ->
                     args = {}
 
                 t0 = time.time()
-                tool_result = await tools.dispatch(name, args, registry)
+                try:
+                    tool_result = await asyncio.wait_for(
+                        tools.dispatch(name, args, registry),
+                        timeout=_TOOL_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    # Surface it as a normal tool error so the model can recover
+                    # (try a narrower query) instead of the run hanging.
+                    tool_result = {
+                        "error": f"tool '{name}' exceeded the "
+                        f"{_TOOL_TIMEOUT_SECONDS}s time limit and was cancelled"
+                    }
                 latency_ms = int((time.time() - t0) * 1000)
 
                 try:
